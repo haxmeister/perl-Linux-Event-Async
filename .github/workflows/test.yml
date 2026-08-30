@@ -1,0 +1,48 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  perl:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Linux::Event::Async
+        uses: actions/checkout@v4
+        with:
+          path: async
+
+      - name: Check out Linux::Event native consumer branch
+        uses: actions/checkout@v4
+        with:
+          repository: haxmeister/perl-linux-event
+          ref: feature/native-consumer-abi
+          path: linux-event
+
+      - name: Set up Perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.40'
+
+      - name: Install build dependencies
+        run: |
+          cpanm --notest Future::AsyncAwait
+          cd linux-event
+          cpanm --notest --installdeps .
+
+      - name: Build and install Linux::Event feature branch
+        run: |
+          cd linux-event
+          perl Makefile.PL
+          make -j2
+          make test
+          make install
+
+      - name: Build and test Linux::Event::Async
+        run: |
+          cd async
+          perl Makefile.PL
+          make -j2
+          make test
+          make disttest
