@@ -31,9 +31,13 @@ sub cancel_recv ($self) {
     return $self;
 }
 
-sub AWAIT_IS_READY ($self) { _recv_is_ready($self) }
-sub AWAIT_IS_CANCELLED ($self) { _recv_is_cancelled($self) }
-sub AWAIT_GET ($self) { _recv_get($self) }
+# These XSUBs already have exactly the public Awaitable call signature and
+# return semantics. Install them directly so Future::AsyncAwait does not pay an
+# additional Perl sub call for every readiness probe and result extraction.
+*AWAIT_IS_READY = \&_recv_is_ready;
+*AWAIT_IS_CANCELLED = \&_recv_is_cancelled;
+*AWAIT_GET = \&_recv_get;
+
 sub AWAIT_ON_READY ($self, $code) {
     croak 'AWAIT_ON_READY requires a coderef' if ref($code) ne 'CODE';
     _recv_on_ready($self, $code);
