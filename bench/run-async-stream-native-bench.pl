@@ -55,8 +55,8 @@ async sub consume_async ($stream, $target) {
 
 sub consume_manual ($stream, $state) {
     my $ready;
-    $ready = sub ($awaitable) {
-        my $message = $awaitable->AWAIT_GET;
+    $ready = sub {
+        my $message = $stream->AWAIT_GET;
         die "unexpected EOF after $state->{count} messages" if !defined $message;
         $state->{count}++;
         if ($state->{count} == $state->{target}) {
@@ -74,8 +74,8 @@ sub consume_manual ($stream, $state) {
 
 sub consume_manual_xs ($stream, $state) {
     my $ready;
-    $ready = sub ($awaitable) {
-        my $message = Linux::Event::Async::Stream::_recv_get($awaitable);
+    $ready = sub {
+        my $message = Linux::Event::Async::Stream::_recv_get($stream);
         die "unexpected EOF after $state->{count} messages" if !defined $message;
         $state->{count}++;
         if ($state->{count} == $state->{target}) {
