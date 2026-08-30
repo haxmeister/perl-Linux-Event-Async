@@ -6,15 +6,16 @@
 typedef struct lea_recv_ctx_s {
     const les_consumer_host_api_v1_t *host;
     void *host_context;
-    SV *stream;
     SV *result;
     SV *failure;
+    SV *terminal_failure;
     SV *on_ready;
     SV *on_cancel;
     int armed;
     int ready;
     int cancelled;
     int in_delivery;
+    int terminal;
 } lea_recv_ctx_t;
 
 #define LEA_CTX_KEY "_linux_event_async_recv_ctx"
@@ -28,12 +29,20 @@ lea_stream_hv(SV *stream)
     return (HV *)SvRV(stream);
 }
 
+static SV *
+lea_ctx_stream(pTHX_ lea_recv_ctx_t *ctx)
+{
+    SV *stream = ctx->host->stream(aTHX_ ctx->host_context);
+    if (!stream || !SvOK(stream))
+        croak("Linux::Event::Async Stream host is no longer available");
+    return stream;
+}
+
 static void
 lea_store_ctx(SV *stream, lea_recv_ctx_t *ctx)
 {
     HV *hv = lea_stream_hv(stream);
-    hv_store(hv, LEA_CTX_KEY, LEA_CTX_KEY_LEN,
-        newSVuv(PTR2UV(ctx)), 0);
+    hv_store(hv, LEA_CTX_KEY, LEA_CTX_KEY_LEN, newSVuv(PTR2UV(ctx)), 0);
 }
 
 static lea_recv_ctx_t *
@@ -55,41 +64,79 @@ lea_clear_sv(SV **slot)
     }
 }
 
-static void
-lea_call(SV *code, SV *arg)
+static SV *
+lea_error_new(uint32_t event, int error, const char *message)
 {
-    dSP;
-    SV *error = NULL;
+    HV *hv = newHV();
+    const char *type = "event";
+    const char *operation = "read";
+    const char *text = message && *message ? message : "Linux::Event Stream failure";
 
-    ENTER;
-    SAVETMPS;
-    PUSHMARK(SP);
-    XPUSHs(arg);
-    PUTBACK;
-    call_sv(code, G_VOID | G_EVAL);
-    SPAGAIN;
-    if (SvTRUE(ERRSV))
-        error = newSVsv(ERRSV);
-    PUTBACK;
-    FREETMPS;
-    LEAVE;
+    if (event == LES_CONSUMER_EVENT_READ_ERROR)
+        type = "io";
+    else if (event == LES_CONSUMER_EVENT_FRAMING_ERROR)
+        type = "framing";
+    else if (event == LES_CONSUMER_EVENT_CLOSED)
+        text = message && *message ? message : "Stream closed while receive was pending";
+    else if (event == LES_CONSUMER_EVENT_DETACHED)
+        text = message && *message ? message : "Stream detached while receive was pending";
 
+    hv_stores(hv, "type", newSVpv(type, 0));
+    hv_stores(hv, "operation", newSVpv(operation, 0));
+    hv_stores(hv, "message", newSVpv(text, 0));
     if (error)
-        croak_sv(error);
+        hv_stores(hv, "errno", newSViv(error));
+
+    return sv_bless(newRV_noinc((SV *)hv), gv_stashpv("Linux::Event::Error", GV_ADD));
 }
 
 static void
-lea_finish_ready(pTHX_ lea_recv_ctx_t *ctx)
+lea_call_owned(pTHX_ lea_recv_ctx_t *ctx, SV *code)
 {
-    SV *callback;
-    if (!ctx->on_ready)
-        return;
-    callback = ctx->on_ready;
-    ctx->on_ready = NULL;
+    dSP;
+    SV *stream = lea_ctx_stream(aTHX_ ctx);
+
+    ENTER;
+    SAVETMPS;
+    SAVEFREESV(code);
+    SAVEINT(ctx->in_delivery);
     ctx->in_delivery = 1;
-    lea_call(callback, ctx->stream);
-    ctx->in_delivery = 0;
-    SvREFCNT_dec(callback);
+    PUSHMARK(SP);
+    EXTEND(SP, 1);
+    PUSHs(stream);
+    PUTBACK;
+    call_sv(code, G_DISCARD | G_VOID);
+    FREETMPS;
+    LEAVE;
+}
+
+static void
+lea_fire_ready(pTHX_ lea_recv_ctx_t *ctx)
+{
+    SV *callback = ctx->on_ready;
+    ctx->on_ready = NULL;
+    if (callback)
+        lea_call_owned(aTHX_ ctx, callback);
+}
+
+static void
+lea_fire_cancel(pTHX_ lea_recv_ctx_t *ctx)
+{
+    SV *callback = ctx->on_cancel;
+    ctx->on_cancel = NULL;
+    if (callback)
+        lea_call_owned(aTHX_ ctx, callback);
+}
+
+static void
+lea_prepare_terminal_result(lea_recv_ctx_t *ctx)
+{
+    lea_clear_sv(&ctx->result);
+    lea_clear_sv(&ctx->failure);
+    if (ctx->terminal_failure)
+        ctx->failure = SvREFCNT_inc(ctx->terminal_failure);
+    ctx->ready = 1;
+    ctx->cancelled = 0;
 }
 
 static void *
@@ -97,12 +144,12 @@ lea_consumer_create(pTHX_ const les_consumer_host_api_v1_t *host,
     void *host_context, SV *stream)
 {
     lea_recv_ctx_t *ctx;
+
     Newxz(ctx, 1, lea_recv_ctx_t);
     if (!ctx)
         return NULL;
     ctx->host = host;
     ctx->host_context = host_context;
-    ctx->stream = SvREFCNT_inc(stream);
     lea_store_ctx(stream, ctx);
     return ctx;
 }
@@ -122,7 +169,7 @@ lea_consumer_message(pTHX_ void *context, SV *message)
     ctx->ready = 1;
     ctx->cancelled = 0;
 
-    lea_finish_ready(aTHX_ ctx);
+    lea_fire_ready(aTHX_ ctx);
     return ctx->armed ? LES_CONSUMER_CONTINUE : LES_CONSUMER_PAUSE;
 }
 
@@ -131,48 +178,43 @@ lea_consumer_event(pTHX_ void *context, uint32_t event, int error,
     const char *message)
 {
     lea_recv_ctx_t *ctx = (lea_recv_ctx_t *)context;
-    SV *text;
 
-    if (!ctx->armed || ctx->ready)
+    if (ctx->terminal)
+        return;
+
+    ctx->terminal = 1;
+    lea_clear_sv(&ctx->terminal_failure);
+    if (event != LES_CONSUMER_EVENT_EOF)
+        ctx->terminal_failure = lea_error_new(event, error, message);
+
+    if (!ctx->armed)
         return;
 
     ctx->armed = 0;
-    ctx->ready = 1;
-    ctx->cancelled = 0;
-    lea_clear_sv(&ctx->result);
-    lea_clear_sv(&ctx->failure);
-
-    if (event != LES_CONSUMER_EVENT_EOF) {
-        if (message && *message)
-            text = newSVpv(message, 0);
-        else if (error)
-            text = newSVpvf("Linux::Event Stream consumer error %d", error);
-        else
-            text = newSVpv("Linux::Event Stream closed", 0);
-        ctx->failure = text;
-    }
-
-    lea_finish_ready(aTHX_ ctx);
+    lea_prepare_terminal_result(ctx);
+    lea_fire_ready(aTHX_ ctx);
 }
 
 static void
 lea_consumer_destroy(pTHX_ void *context)
 {
     lea_recv_ctx_t *ctx = (lea_recv_ctx_t *)context;
-    HV *hv;
+    SV *stream;
 
     if (!ctx)
         return;
-    if (ctx->stream && SvROK(ctx->stream) && SvTYPE(SvRV(ctx->stream)) == SVt_PVHV) {
-        hv = (HV *)SvRV(ctx->stream);
-        hv_delete(hv, LEA_CTX_KEY, LEA_CTX_KEY_LEN, G_DISCARD);
+
+    stream = ctx->host->stream(aTHX_ ctx->host_context);
+    if (stream && SvOK(stream) && SvROK(stream)
+        && SvTYPE(SvRV(stream)) == SVt_PVHV) {
+        hv_delete((HV *)SvRV(stream), LEA_CTX_KEY, LEA_CTX_KEY_LEN, G_DISCARD);
     }
+
     lea_clear_sv(&ctx->result);
     lea_clear_sv(&ctx->failure);
+    lea_clear_sv(&ctx->terminal_failure);
     lea_clear_sv(&ctx->on_ready);
     lea_clear_sv(&ctx->on_cancel);
-    if (ctx->stream)
-        SvREFCNT_dec(ctx->stream);
     Safefree(ctx);
 }
 
@@ -208,21 +250,42 @@ _recv_arm(stream)
             croak("recv(): a receive is already pending");
         if (ctx->ready)
             croak("recv(): previous receive result has not been consumed");
-        ctx->armed = 1;
+
         ctx->cancelled = 0;
+        lea_clear_sv(&ctx->on_ready);
+        lea_clear_sv(&ctx->on_cancel);
+
+        if (ctx->terminal) {
+            lea_prepare_terminal_result(ctx);
+            XSRETURN_EMPTY;
+        }
+
+        ctx->armed = 1;
         if (!ctx->in_delivery) {
             status = ctx->host->resume(aTHX_ ctx->host_context);
             if (status < 0) {
                 ctx->armed = 0;
                 croak("recv(): Linux::Event consumer resume failed");
             }
+            if (status == 0 && !ctx->ready && !ctx->terminal
+                && ctx->host->is_closed(aTHX_ ctx->host_context)) {
+                ctx->armed = 0;
+                ctx->terminal = 1;
+                ctx->terminal_failure = lea_error_new(
+                    LES_CONSUMER_EVENT_CLOSED, 0,
+                    "Stream closed while receive was being armed");
+                lea_prepare_terminal_result(ctx);
+            }
         }
 
 int
 _recv_is_ready(stream)
     SV *stream
+    PREINIT:
+        lea_recv_ctx_t *ctx;
     CODE:
-        RETVAL = lea_get_ctx(stream)->ready;
+        ctx = lea_get_ctx(stream);
+        RETVAL = ctx->ready || ctx->cancelled;
     OUTPUT:
         RETVAL
 
@@ -243,17 +306,20 @@ _recv_get(stream)
         SV *failure;
     CODE:
         ctx = lea_get_ctx(stream);
+        if (ctx->cancelled)
+            croak("cannot get a cancelled receive");
         if (!ctx->ready)
             croak("AWAIT_GET called while receive is pending");
-        failure = ctx->failure ? newSVsv(ctx->failure) : NULL;
-        result = ctx->result ? newSVsv(ctx->result) : newSV(0);
-        lea_clear_sv(&ctx->result);
-        lea_clear_sv(&ctx->failure);
+
+        failure = ctx->failure;
+        ctx->failure = NULL;
+        result = ctx->result;
+        ctx->result = NULL;
         ctx->ready = 0;
-        ctx->cancelled = 0;
+
         if (failure)
             croak_sv(failure);
-        RETVAL = result;
+        RETVAL = result ? result : newSV(0);
     OUTPUT:
         RETVAL
 
@@ -267,8 +333,8 @@ _recv_on_ready(stream, code)
         ctx = lea_get_ctx(stream);
         if (!SvROK(code) || SvTYPE(SvRV(code)) != SVt_PVCV)
             croak("AWAIT_ON_READY requires a coderef");
-        if (ctx->ready) {
-            lea_call(code, stream);
+        if (ctx->ready || ctx->cancelled) {
+            lea_call_owned(aTHX_ ctx, SvREFCNT_inc(code));
         }
         else {
             lea_clear_sv(&ctx->on_ready);
@@ -286,9 +352,9 @@ _recv_on_cancel(stream, code)
         if (!SvROK(code) || SvTYPE(SvRV(code)) != SVt_PVCV)
             croak("AWAIT_ON_CANCEL requires a coderef");
         if (ctx->cancelled) {
-            lea_call(code, stream);
+            lea_call_owned(aTHX_ ctx, SvREFCNT_inc(code));
         }
-        else {
+        else if (ctx->armed) {
             lea_clear_sv(&ctx->on_cancel);
             ctx->on_cancel = SvREFCNT_inc(code);
         }
@@ -298,17 +364,14 @@ _recv_cancel(stream)
     SV *stream
     PREINIT:
         lea_recv_ctx_t *ctx;
-        SV *callback;
     CODE:
         ctx = lea_get_ctx(stream);
         if (!ctx->armed)
             XSRETURN_EMPTY;
+
         ctx->armed = 0;
         ctx->cancelled = 1;
-        ctx->host->pause(aTHX_ ctx->host_context);
-        callback = ctx->on_cancel;
-        ctx->on_cancel = NULL;
-        if (callback) {
-            lea_call(callback, stream);
-            SvREFCNT_dec(callback);
-        }
+        if (!ctx->terminal)
+            ctx->host->pause(aTHX_ ctx->host_context);
+        lea_fire_cancel(aTHX_ ctx);
+        lea_fire_ready(aTHX_ ctx);
