@@ -5,6 +5,8 @@ use warnings;
 
 use Carp qw(croak);
 
+our $VERSION = '0.001_001';
+
 sub new ($class, %opt) {
     return bless {
         loop       => delete $opt{loop},
@@ -90,7 +92,13 @@ sub cancel ($self) {
     return $self if $self->{state} ne 'pending';
     $self->{state} = 'cancelled';
     for my $other (@{delete($self->{cancel}) // []}) {
-        $other->cancel if $other && $other->can('cancel');
+        next if !$other;
+        if ($other->can('cancel')) {
+            $other->cancel;
+        }
+        elsif ($other->can('cancel_recv')) {
+            $other->cancel_recv;
+        }
     }
     $_->($self) for @{delete($self->{on_cancel}) // []};
     $self->_fire_ready;
