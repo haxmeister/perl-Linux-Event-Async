@@ -81,6 +81,12 @@ Only one receive may be active. Clean EOF resolves to C<undef>. Cancelling a
 pending receive pauses consumer delivery without closing the Stream or consuming
 the next message.
 
+Within one native input drain, the consumer may retain up to 64 additional
+messages and approximately 256 KiB of payload before waking the pending
+receive. The byte boundary permits one complete-frame overshoot. This bounded
+prefetch makes consecutive receives immediately ready while preserving Stream
+pause and kernel backpressure when the coroutine stops consuming.
+
 A concrete subclass must declare a built-in native framer. Callback delivery
 through C<on_message> or C<on_messages> cannot be mixed with this consumer.
 

@@ -59,6 +59,83 @@ sub pair () {
 
 {
     my ($loop, $stream, $peer) = pair();
+
+    async sub read_numbered ($s, $count) {
+        my @messages;
+        for my $index (1 .. $count) {
+            push @messages, await $s->recv;
+        }
+        return \@messages;
+    }
+
+    my @expected = map { sprintf 'message-%03d', $_ } 1 .. 150;
+    my $wire = join '', map { "$_\n" } @expected;
+    syswrite($peer, $wire) == length($wire) or die "short bulk write: $!";
+    Linux::Event::Async::Stream::_recv_profile_start($stream);
+    my $messages = read_numbered($stream, scalar @expected)->AWAIT_WAIT;
+    is_deeply($messages, \@expected,
+        'bounded prefetch preserves order across more than one full ring');
+    my $profile = Linux::Event::Async::Stream::_recv_profile_stats($stream);
+    cmp_ok($profile->{recv_immediate}, '>', 100,
+        'bulk buffered input completes most receives immediately');
+    cmp_ok($profile->{await_suspended}, '<', 5,
+        'bulk buffered input avoids per-message FAA suspension');
+
+    $stream->close;
+    close $peer;
+}
+
+{
+    my ($loop, $stream, $peer) = pair();
+
+    async sub read_slice ($s, $count) {
+        my @messages;
+        for my $index (1 .. $count) {
+            push @messages, await $s->recv;
+        }
+        return \@messages;
+    }
+
+    my @expected = map { "item-$_" } 1 .. 100;
+    my $wire = join '', map { "$_\n" } @expected;
+    my $first = read_slice($stream, 10);
+    syswrite($peer, $wire) == length($wire) or die "short queued write: $!";
+    is_deeply($first->AWAIT_WAIT, [@expected[0 .. 9]],
+        'consumer may stop with prefetched messages retained');
+    is_deeply(read_slice($stream, 90)->AWAIT_WAIT, [@expected[10 .. 99]],
+        'a later receive drains retained messages before native input');
+
+    $stream->close;
+    close $peer;
+}
+
+{
+    my ($loop, $stream, $peer) = pair();
+
+    async sub read_through_eof ($s, $count) {
+        my @messages;
+        for my $index (1 .. $count) {
+            push @messages, await $s->recv;
+        }
+        my $eof = await $s->recv;
+        return [\@messages, $eof];
+    }
+
+    my @expected = map { "eof-$_" } 1 .. 100;
+    my $wire = join '', map { "$_\n" } @expected;
+    my $future = read_through_eof($stream, scalar @expected);
+    syswrite($peer, $wire) == length($wire) or die "short EOF write: $!";
+    close $peer;
+    my ($messages, $eof) = $future->AWAIT_WAIT->@*;
+    is_deeply($messages, \@expected,
+        'terminal EOF is ordered after every prefetched message');
+    is($eof, undef, 'receive after the prefetched batch observes clean EOF');
+
+    $stream->close;
+}
+
+{
+    my ($loop, $stream, $peer) = pair();
     my $recv = $stream->recv;
     my ($cancelled, $ready) = (0, 0);
     $recv->AWAIT_ON_CANCEL(sub { $cancelled++ });
