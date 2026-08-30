@@ -8,7 +8,7 @@ use Carp qw(croak);
 our $VERSION = '0.001_001';
 
 require XSLoader;
-XSLoader::load('Linux::Event::Async', $VERSION);
+XSLoader::load(__PACKAGE__, $VERSION);
 
 sub done ($self, @result) {
     return $self->AWAIT_DONE(@result);
