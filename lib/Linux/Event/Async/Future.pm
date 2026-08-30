@@ -27,7 +27,9 @@ sub AWAIT_NEW_DONE ($class, @result) {
 
 sub AWAIT_NEW_FAIL ($class, $error) {
     my $self = $class->new;
-    $self->AWAIT_FAIL($error);
+    $self->{state} = 'failed';
+    $self->{error} = $error;
+    $self->_fire_ready;
     return $self;
 }
 
@@ -55,7 +57,10 @@ sub AWAIT_IS_READY ($self) { $self->{state} ne 'pending' }
 sub AWAIT_IS_CANCELLED ($self) { $self->{state} eq 'cancelled' }
 
 sub AWAIT_GET ($self) {
-    die $self->{error} if $self->{state} eq 'failed';
+    if ($self->{state} eq 'failed') {
+        die $self->{error} if ref $self->{error};
+        croak defined($self->{error}) ? $self->{error} : '';
+    }
     croak 'cannot get a pending future' if $self->{state} eq 'pending';
     croak 'cannot get a cancelled future' if $self->{state} eq 'cancelled';
     return wantarray ? @{$self->{result}} : $self->{result}[0];
