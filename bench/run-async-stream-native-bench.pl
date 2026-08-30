@@ -55,20 +55,21 @@ async sub consume_async ($stream, $target) {
 
 sub consume_manual ($stream, $state) {
     my $ready;
+    my $awaitable;
     $ready = sub {
-        my $message = $stream->AWAIT_GET;
+        my $message = $awaitable->AWAIT_GET;
         die "unexpected EOF after $state->{count} messages" if !defined $message;
         $state->{count}++;
         if ($state->{count} == $state->{target}) {
             $state->{loop}->stop;
             return;
         }
-        $stream->recv;
-        $stream->AWAIT_ON_READY($ready);
+        $awaitable = $stream->recv;
+        $awaitable->AWAIT_ON_READY($ready);
         return;
     };
-    $stream->recv;
-    $stream->AWAIT_ON_READY($ready);
+    $awaitable = $stream->recv;
+    $awaitable->AWAIT_ON_READY($ready);
     return;
 }
 

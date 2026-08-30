@@ -25,7 +25,9 @@ sub pair () {
 {
     my ($loop, $stream, $peer) = pair();
     my $recv = $stream->recv;
-    is(refaddr($recv), refaddr($stream), 'recv returns the reusable Stream awaitable');
+    isa_ok($recv, 'Linux::Event::Async::Stream::Awaitable');
+    isnt(refaddr($recv), refaddr($stream),
+        'recv returns a native Awaitable view, not the Stream hash');
     ok(!$recv->AWAIT_IS_READY, 'receive starts pending');
 
     $recv->AWAIT_ON_READY(sub { $loop->stop });
@@ -35,6 +37,8 @@ sub pair () {
     is($recv->AWAIT_GET, 'one', 'first framed message is returned');
 
     my $second = $stream->recv;
+    is(refaddr($second), refaddr($recv),
+        'recv reuses one persistent Awaitable view');
     ok($second->AWAIT_IS_READY,
         'buffered second frame completes synchronously when receive is rearmed');
     is($second->AWAIT_GET, 'two', 'second framed message preserves order');
@@ -108,7 +112,7 @@ sub pair () {
     my $future = wait_one($stream);
     $future->cancel;
     ok($future->AWAIT_IS_CANCELLED, 'async-sub result can be cancelled');
-    ok($stream->recv->AWAIT_IS_READY == 0,
+    ok(!$stream->recv->AWAIT_IS_READY,
         'cancelling async-sub result releases the pending Stream receive');
     $stream->cancel_recv;
 
