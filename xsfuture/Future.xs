@@ -18,6 +18,7 @@ typedef struct leaf_future_s {
     SV *ready_callback;
     AV *ready_callbacks;
     AV *cancel_callbacks;
+    SV *cancel_target;
     AV *cancel_chain;
 } leaf_future_t;
 
@@ -178,6 +179,35 @@ leaf_cancel_target(pTHX_ SV *target, SV **failure)
     LEAVE;
 }
 
+static int
+leaf_same_cancel_target(SV *left, SV *right)
+{
+    if (left == right)
+        return 1;
+    return SvROK(left) && SvROK(right) && SvRV(left) == SvRV(right);
+}
+
+static void
+leaf_add_cancel_target(leaf_future_t *future, SV *target)
+{
+    SSize_t count;
+    SV **last;
+
+    if (!future->cancel_target) {
+        future->cancel_target = newSVsv(target);
+        return;
+    }
+    if (leaf_same_cancel_target(future->cancel_target, target))
+        return;
+    if (!future->cancel_chain)
+        future->cancel_chain = newAV();
+    count = av_count(future->cancel_chain);
+    last = count ? av_fetch(future->cancel_chain, count - 1, 0) : NULL;
+    if (last && *last && leaf_same_cancel_target(*last, target))
+        return;
+    av_push(future->cancel_chain, newSVsv(target));
+}
+
 static void
 leaf_cancel_chain(pTHX_ AV *chain, SV **failure)
 {
@@ -201,6 +231,10 @@ leaf_discard_cancel_state(leaf_future_t *future)
     if (future->cancel_callbacks) {
         SvREFCNT_dec((SV *)future->cancel_callbacks);
         future->cancel_callbacks = NULL;
+    }
+    if (future->cancel_target) {
+        SvREFCNT_dec(future->cancel_target);
+        future->cancel_target = NULL;
     }
     if (future->cancel_chain) {
         SvREFCNT_dec((SV *)future->cancel_chain);
@@ -451,9 +485,7 @@ AWAIT_CHAIN_CANCEL(future_obj, target)
             if (failure)
                 croak_sv(sv_2mortal(failure));
         } else if (future->state == LEAF_PENDING) {
-            if (!future->cancel_chain)
-                future->cancel_chain = newAV();
-            av_push(future->cancel_chain, newSVsv(target));
+            leaf_add_cancel_target(future, target);
         }
 
 SV *
@@ -462,6 +494,7 @@ cancel(future_obj)
     PREINIT:
         leaf_future_t *future;
         AV *cancel_callbacks;
+        SV *cancel_target;
         AV *cancel_chain;
         SV *ready_callback;
         AV *ready_callbacks;
@@ -470,15 +503,21 @@ cancel(future_obj)
         future = leaf_from_sv(future_obj);
         if (future->state == LEAF_PENDING) {
             cancel_callbacks = future->cancel_callbacks;
+            cancel_target = future->cancel_target;
             cancel_chain = future->cancel_chain;
             ready_callback = future->ready_callback;
             ready_callbacks = future->ready_callbacks;
             future->cancel_callbacks = NULL;
+            future->cancel_target = NULL;
             future->cancel_chain = NULL;
             future->ready_callback = NULL;
             future->ready_callbacks = NULL;
             future->state = LEAF_CANCELLED;
             leaf_call_callbacks(aTHX_ cancel_callbacks, &failure);
+            if (cancel_target) {
+                leaf_cancel_target(aTHX_ cancel_target, &failure);
+                SvREFCNT_dec(cancel_target);
+            }
             leaf_cancel_chain(aTHX_ cancel_chain, &failure);
             leaf_call_callback_catching(aTHX_ ready_callback, &failure);
             leaf_call_callbacks(aTHX_ ready_callbacks, &failure);
@@ -516,6 +555,7 @@ DESTROY(future_obj)
                 if (future->ready_callback) SvREFCNT_dec(future->ready_callback);
                 if (future->ready_callbacks) SvREFCNT_dec((SV *)future->ready_callbacks);
                 if (future->cancel_callbacks) SvREFCNT_dec((SV *)future->cancel_callbacks);
+                if (future->cancel_target) SvREFCNT_dec(future->cancel_target);
                 if (future->cancel_chain) SvREFCNT_dec((SV *)future->cancel_chain);
                 Safefree(future);
                 sv_setiv(SvRV(future_obj), 0);

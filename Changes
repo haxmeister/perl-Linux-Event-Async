@@ -8,3 +8,9 @@ Revision history for Linux-Event-Async
       Linux::Event native Stream consumer ABI.
     - Add Linux::Event::Async::Future for async-sub result Futures.
     - Vendor the Linux::Event consumer ABI v1 header.
+    - Return one persistent native Awaitable view from Stream recv, removing
+      Stream hash lookup from the hot AWAIT_* methods.
+    - Move Stream recv into XS so receive arming and Awaitable return no longer
+      cross a Perl method trampoline.
+    - Deduplicate repeated cancellation chaining to the persistent Stream
+      Awaitable, keeping cancellation retention bounded across receive loops.

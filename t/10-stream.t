@@ -29,11 +29,19 @@ sub pair () {
     isnt(refaddr($recv), refaddr($stream),
         'recv returns a native Awaitable view, not the Stream hash');
     ok(!$recv->AWAIT_IS_READY, 'receive starts pending');
+    my $pending_error = eval { $stream->recv; 1 } ? '' : $@;
+    like($pending_error, qr/a receive is already pending/,
+        'a second receive cannot overlap the current generation');
 
-    $recv->AWAIT_ON_READY(sub { $loop->stop });
+    my $first_ready = 0;
+    $recv->AWAIT_ON_READY(sub { $first_ready++; $loop->stop });
     syswrite($peer, "one\ntwo\n") == 8 or die "short write: $!";
     $loop->run;
     ok($recv->AWAIT_IS_READY, 'first framed message makes receive ready');
+    is($first_ready, 1, 'first-generation ready callback fires once');
+    my $unconsumed_error = eval { $stream->recv; 1 } ? '' : $@;
+    like($unconsumed_error, qr/previous receive result has not been consumed/,
+        'next generation cannot start before the result is consumed');
     is($recv->AWAIT_GET, 'one', 'first framed message is returned');
 
     my $second = $stream->recv;
@@ -41,6 +49,8 @@ sub pair () {
         'recv reuses one persistent Awaitable view');
     ok($second->AWAIT_IS_READY,
         'buffered second frame completes synchronously when receive is rearmed');
+    is($first_ready, 1,
+        'callback from the prior generation is not reused');
     is($second->AWAIT_GET, 'two', 'second framed message preserves order');
 
     $stream->close;
