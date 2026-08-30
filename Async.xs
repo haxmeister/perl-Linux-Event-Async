@@ -29,15 +29,6 @@ lea_stream_hv(SV *stream)
     return (HV *)SvRV(stream);
 }
 
-static SV *
-lea_ctx_stream(pTHX_ lea_recv_ctx_t *ctx)
-{
-    SV *stream = ctx->host->stream(aTHX_ ctx->host_context);
-    if (!stream || !SvOK(stream))
-        croak("Linux::Event::Async Stream host is no longer available");
-    return stream;
-}
-
 static void
 lea_store_ctx(SV *stream, lea_recv_ctx_t *ctx)
 {
@@ -94,7 +85,6 @@ static void
 lea_call_owned(pTHX_ lea_recv_ctx_t *ctx, SV *code)
 {
     dSP;
-    SV *stream = lea_ctx_stream(aTHX_ ctx);
 
     ENTER;
     SAVETMPS;
@@ -102,8 +92,6 @@ lea_call_owned(pTHX_ lea_recv_ctx_t *ctx, SV *code)
     SAVEINT(ctx->in_delivery);
     ctx->in_delivery = 1;
     PUSHMARK(SP);
-    EXTEND(SP, 1);
-    PUSHs(stream);
     PUTBACK;
     call_sv(code, G_DISCARD | G_VOID);
     FREETMPS;
@@ -230,6 +218,7 @@ static const les_consumer_ops_v1_t lea_consumer_ops = {
 };
 
 MODULE = Linux::Event::Async    PACKAGE = Linux::Event::Async::Stream
+PROTOTYPES: DISABLE
 
 UV
 _consumer_operations_address()
