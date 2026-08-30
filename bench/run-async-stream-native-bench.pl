@@ -53,6 +53,44 @@ async sub consume_async ($stream, $target) {
     return $count;
 }
 
+sub consume_manual ($stream, $state) {
+    my $ready;
+    $ready = sub ($awaitable) {
+        my $message = $awaitable->AWAIT_GET;
+        die "unexpected EOF after $state->{count} messages" if !defined $message;
+        $state->{count}++;
+        if ($state->{count} == $state->{target}) {
+            $state->{loop}->stop;
+            return;
+        }
+        $stream->recv;
+        $stream->AWAIT_ON_READY($ready);
+        return;
+    };
+    $stream->recv;
+    $stream->AWAIT_ON_READY($ready);
+    return;
+}
+
+sub consume_manual_xs ($stream, $state) {
+    my $ready;
+    $ready = sub ($awaitable) {
+        my $message = Linux::Event::Async::Stream::_recv_get($awaitable);
+        die "unexpected EOF after $state->{count} messages" if !defined $message;
+        $state->{count}++;
+        if ($state->{count} == $state->{target}) {
+            $state->{loop}->stop;
+            return;
+        }
+        Linux::Event::Async::Stream::_recv_arm($stream);
+        Linux::Event::Async::Stream::_recv_on_ready($stream, $ready);
+        return;
+    };
+    Linux::Event::Async::Stream::_recv_arm($stream);
+    Linux::Event::Async::Stream::_recv_on_ready($stream, $ready);
+    return;
+}
+
 my $sizes = '2500,35000,200000';
 my $repeat = 7;
 my $warmup = 2;
@@ -139,8 +177,16 @@ sub run_once ($kind, $payload_size, $messages) {
         data => $state,
     );
 
-    my $task = $kind eq 'async'
-        ? consume_async($receiver, $messages) : undef;
+    my $task;
+    if ($kind eq 'async') {
+        $task = consume_async($receiver, $messages);
+    }
+    elsif ($kind eq 'manual') {
+        consume_manual($receiver, $state);
+    }
+    elsif ($kind eq 'manual_xs') {
+        consume_manual_xs($receiver, $state);
+    }
 
     my $started = clock_gettime(CLOCK_MONOTONIC);
     syswrite($barrier_w, 'G') == 1 or die "barrier release: $!";
@@ -182,14 +228,14 @@ my %historical = (
     },
 );
 
-say "Linux::Event::Async::Stream native delimiter benchmark";
+say "Linux::Event::Async::Stream receive-path isolation benchmark";
 say "transport=AF_UNIX producer=forked barrier=yes read_size=$READ_SIZE read_budget_bytes=$READ_SIZE framing=native delimiter";
-printf "%-8s %10s %13s %13s %13s %13s %13s %10s\n",
-    qw(payload messages callback_now callback_old stream_await_old async_now direct_target retained);
+printf "%-8s %10s %12s %12s %12s %12s %13s %10s\n",
+    qw(payload messages callback manual manual_xs async direct_target retained);
 
 for my $payload_size (@sizes) {
     my $messages = messages_for_size($payload_size);
-    my @kinds = qw(callback async);
+    my @kinds = qw(callback manual manual_xs async);
 
     for (1 .. $warmup) {
         run_once($_, $payload_size, $messages) for @kinds;
@@ -197,7 +243,8 @@ for my $payload_size (@sizes) {
 
     my %samples = map { $_ => [] } @kinds;
     for my $sample (1 .. $repeat) {
-        my @order = $sample % 2 ? @kinds : reverse @kinds;
+        my $rotation = ($sample - 1) % @kinds;
+        my @order = (@kinds[$rotation .. $#kinds], @kinds[0 .. $rotation - 1]);
         for my $kind (@order) {
             push $samples{$kind}->@*, run_once($kind, $payload_size, $messages);
         }
@@ -210,10 +257,10 @@ for my $payload_size (@sizes) {
         or die "no historical comparison for payload $payload_size\n";
     my $retained = 100 * $rate{async} / $old->{direct_awaitable};
 
-    printf "%-8d %10d %13.0f %13d %13d %13.0f %13d %9.1f%%\n",
+    printf "%-8d %10d %12.0f %12.0f %12.0f %12.0f %13d %9.1f%%\n",
         $payload_size, $messages,
-        $rate{callback}, $old->{callback}, $old->{stream_awaitable},
-        $rate{async}, $old->{direct_awaitable}, $retained;
+        @rate{qw(callback manual manual_xs async)},
+        $old->{direct_awaitable}, $retained;
 
     say "samples payload=$payload_size";
     for my $kind (@kinds) {
