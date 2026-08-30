@@ -21,10 +21,6 @@ Linux::Event::Stream->_declare_consumer(
     },
 );
 
-sub recv ($self) {
-    return _recv_arm($self);
-}
-
 sub cancel_recv ($self) {
     _recv_cancel($self);
     return $self;

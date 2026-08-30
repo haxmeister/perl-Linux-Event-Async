@@ -244,6 +244,46 @@ static const les_consumer_ops_v1_t lea_consumer_ops = {
     lea_consumer_destroy
 };
 
+static lea_recv_ctx_t *
+lea_recv_arm(pTHX_ SV *stream)
+{
+    lea_recv_ctx_t *ctx = lea_get_ctx(stream);
+    int status;
+
+    if (ctx->armed)
+        croak("recv(): a receive is already pending");
+    if (ctx->ready)
+        croak("recv(): previous receive result has not been consumed");
+
+    ctx->cancelled = 0;
+    lea_clear_sv(&ctx->on_ready);
+    lea_clear_sv(&ctx->on_cancel);
+
+    if (ctx->terminal) {
+        lea_prepare_terminal_result(ctx);
+        return ctx;
+    }
+
+    ctx->armed = 1;
+    if (!ctx->in_delivery) {
+        status = ctx->host->resume(aTHX_ ctx->host_context);
+        if (status < 0) {
+            ctx->armed = 0;
+            croak("recv(): Linux::Event consumer resume failed");
+        }
+        if (status == 0 && !ctx->ready && !ctx->terminal
+            && ctx->host->is_closed(aTHX_ ctx->host_context)) {
+            ctx->armed = 0;
+            ctx->terminal = 1;
+            ctx->terminal_failure = lea_error_new(
+                LES_CONSUMER_EVENT_CLOSED, 0,
+                "Stream closed while receive was being armed");
+            lea_prepare_terminal_result(ctx);
+        }
+    }
+    return ctx;
+}
+
 MODULE = Linux::Event::Async    PACKAGE = Linux::Event::Async::Stream
 PROTOTYPES: DISABLE
 
@@ -255,45 +295,24 @@ _consumer_operations_address()
         RETVAL
 
 SV *
+recv(stream)
+    SV *stream
+    PREINIT:
+        lea_recv_ctx_t *ctx;
+    CODE:
+        ctx = lea_recv_arm(aTHX_ stream);
+        RETVAL = SvREFCNT_inc(ctx->awaitable);
+    OUTPUT:
+        RETVAL
+
+SV *
 _recv_arm(stream)
     SV *stream
     PREINIT:
         lea_recv_ctx_t *ctx;
-        int status;
     CODE:
-        ctx = lea_get_ctx(stream);
-        if (ctx->armed)
-            croak("recv(): a receive is already pending");
-        if (ctx->ready)
-            croak("recv(): previous receive result has not been consumed");
-
-        ctx->cancelled = 0;
-        lea_clear_sv(&ctx->on_ready);
-        lea_clear_sv(&ctx->on_cancel);
-
-        if (ctx->terminal) {
-            lea_prepare_terminal_result(ctx);
-            RETVAL = SvREFCNT_inc(ctx->awaitable);
-        } else {
-            ctx->armed = 1;
-            if (!ctx->in_delivery) {
-                status = ctx->host->resume(aTHX_ ctx->host_context);
-                if (status < 0) {
-                    ctx->armed = 0;
-                    croak("recv(): Linux::Event consumer resume failed");
-                }
-                if (status == 0 && !ctx->ready && !ctx->terminal
-                    && ctx->host->is_closed(aTHX_ ctx->host_context)) {
-                    ctx->armed = 0;
-                    ctx->terminal = 1;
-                    ctx->terminal_failure = lea_error_new(
-                        LES_CONSUMER_EVENT_CLOSED, 0,
-                        "Stream closed while receive was being armed");
-                    lea_prepare_terminal_result(ctx);
-                }
-            }
-            RETVAL = SvREFCNT_inc(ctx->awaitable);
-        }
+        ctx = lea_recv_arm(aTHX_ stream);
+        RETVAL = SvREFCNT_inc(ctx->awaitable);
     OUTPUT:
         RETVAL
 
