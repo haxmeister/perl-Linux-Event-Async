@@ -13,11 +13,11 @@ jobs:
         with:
           path: async
 
-      - name: Check out Linux::Event native consumer branch
+      - name: Check out Linux::Event main
         uses: actions/checkout@v4
         with:
           repository: haxmeister/perl-linux-event
-          ref: feature/native-consumer-abi
+          ref: main
           path: linux-event
 
       - name: Set up Perl
@@ -31,7 +31,7 @@ jobs:
           cd linux-event
           cpanm --notest --installdeps .
 
-      - name: Build and install Linux::Event feature branch
+      - name: Build and install Linux::Event main
         run: |
           cd linux-event
           perl Makefile.PL
@@ -46,3 +46,8 @@ jobs:
           make -j2
           make test
           make disttest
+
+      - name: Benchmark Linux::Event::Async::Stream
+        run: |
+          cd async
+          perl -Mblib bench/run-async-stream-native-bench.pl --repeat=7 --warmup=2
