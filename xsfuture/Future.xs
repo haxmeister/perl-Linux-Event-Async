@@ -140,6 +140,44 @@ leaf_call_callbacks(pTHX_ AV *callbacks, SV **failure)
     SvREFCNT_dec((SV *)callbacks);
 }
 
+static const char *
+leaf_cancel_method(SV *target)
+{
+    HV *stash;
+
+    if (!target || !sv_isobject(target) || !SvROK(target))
+        return NULL;
+    stash = SvSTASH(SvRV(target));
+    if (stash && gv_fetchmethod_autoload(stash, "cancel", 0))
+        return "cancel";
+    if (stash && gv_fetchmethod_autoload(stash, "cancel_recv", 0))
+        return "cancel_recv";
+    return NULL;
+}
+
+static void
+leaf_cancel_target(pTHX_ SV *target, SV **failure)
+{
+    const char *method = leaf_cancel_method(target);
+    dSP;
+
+    if (!method)
+        return;
+    ENTER;
+    SAVETMPS;
+    PUSHMARK(SP);
+    PUSHs(target);
+    PUTBACK;
+    call_method(method, G_DISCARD | G_VOID | G_EVAL);
+    if (SvTRUE(ERRSV)) {
+        if (!*failure)
+            *failure = newSVsv(ERRSV);
+        sv_setsv(ERRSV, &PL_sv_undef);
+    }
+    FREETMPS;
+    LEAVE;
+}
+
 static void
 leaf_cancel_chain(pTHX_ AV *chain, SV **failure)
 {
@@ -151,22 +189,8 @@ leaf_cancel_chain(pTHX_ AV *chain, SV **failure)
     count = av_count(chain);
     for (index = 0; index < count; index++) {
         SV **target = av_fetch(chain, index, 0);
-        dSP;
-        if (!target || !*target)
-            continue;
-        ENTER;
-        SAVETMPS;
-        PUSHMARK(SP);
-        PUSHs(*target);
-        PUTBACK;
-        call_method("cancel", G_DISCARD | G_VOID | G_EVAL);
-        if (SvTRUE(ERRSV)) {
-            if (!*failure)
-                *failure = newSVsv(ERRSV);
-            sv_setsv(ERRSV, &PL_sv_undef);
-        }
-        FREETMPS;
-        LEAVE;
+        if (target && *target)
+            leaf_cancel_target(aTHX_ *target, failure);
     }
     SvREFCNT_dec((SV *)chain);
 }
@@ -417,20 +441,15 @@ AWAIT_CHAIN_CANCEL(future_obj, target)
     SV *target
     PREINIT:
         leaf_future_t *future;
+        SV *failure = NULL;
     CODE:
         if (!sv_isobject(target) || !SvROK(target))
             croak("cancellation target must be an object");
         future = leaf_from_sv(future_obj);
         if (future->state == LEAF_CANCELLED) {
-            dSP;
-            ENTER;
-            SAVETMPS;
-            PUSHMARK(SP);
-            PUSHs(target);
-            PUTBACK;
-            call_method("cancel", G_DISCARD | G_VOID);
-            FREETMPS;
-            LEAVE;
+            leaf_cancel_target(aTHX_ target, &failure);
+            if (failure)
+                croak_sv(sv_2mortal(failure));
         } else if (future->state == LEAF_PENDING) {
             if (!future->cancel_chain)
                 future->cancel_chain = newAV();
