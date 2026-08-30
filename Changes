@@ -14,3 +14,9 @@ Revision history for Linux-Event-Async
       cross a Perl method trampoline.
     - Deduplicate repeated cancellation chaining to the persistent Stream
       Awaitable, keeping cancellation retention bounded across receive loops.
+    - Batch native delivery behind the consumer ABI end-of-drain hook and a
+      bounded 64-message, 256 KiB prefetch ring. Consecutive receives consume
+      retained messages immediately instead of suspending through FAA once per
+      frame, while consumer pause continues to provide bounded backpressure.
+    - Add opt-in receive-path counters and separate receiver/producer CPU
+      affinity controls to the matched native Stream benchmark.

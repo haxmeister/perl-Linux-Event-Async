@@ -8,6 +8,7 @@
 
 #define LES_CONSUMER_ABI_VERSION 1U
 #define LES_CONSUMER_F_START_PAUSED 0x01U
+#define LES_CONSUMER_F_WANT_FLUSH   0x02U
 #define LES_CONSUMER_CONTINUE 0
 #define LES_CONSUMER_PAUSE    1
 #define LES_CONSUMER_CLOSE    2
@@ -38,6 +39,10 @@ typedef struct les_consumer_ops_v1_s {
     void (*event)(pTHX_ void *context, uint32_t event, int error,
         const char *message);
     void (*destroy)(pTHX_ void *context);
+    int (*flush)(pTHX_ void *context);
 } les_consumer_ops_v1_t;
+
+#define LES_CONSUMER_OPS_V1_REQUIRED_SIZE \
+    offsetof(les_consumer_ops_v1_t, flush)
 
 #endif

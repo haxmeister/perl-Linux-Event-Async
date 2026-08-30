@@ -95,11 +95,16 @@ sub consume_manual_xs ($stream, $state) {
 my $sizes = '2500,35000,200000';
 my $repeat = 7;
 my $warmup = 2;
+my $profile = 0;
+my ($receiver_cpu, $producer_cpu);
 
 GetOptions(
     'sizes=s'  => \$sizes,
     'repeat=i' => \$repeat,
     'warmup=i' => \$warmup,
+    'profile!' => \$profile,
+    'receiver-cpu=i' => \$receiver_cpu,
+    'producer-cpu=i' => \$producer_cpu,
 ) or die "invalid options\n";
 
 die "repeat must be positive\n" if $repeat < 1;
@@ -130,7 +135,26 @@ sub write_all ($fh, $bytes) {
     }
 }
 
+sub pin_cpu ($cpu) {
+    return if !defined $cpu;
+    my $target = $$;
+    my $helper = fork();
+    die "fork affinity helper: $!" if !defined $helper;
+    if ($helper == 0) {
+        open STDOUT, '>', '/dev/null' or _exit(126);
+        open STDERR, '>&', \*STDOUT or _exit(126);
+        {
+            no warnings 'exec';
+            exec 'taskset', '-pc', $cpu, $target;
+            _exit(127);
+        }
+    }
+    waitpid($helper, 0);
+    die "cannot pin process $target to CPU $cpu\n" if $? != 0;
+}
+
 sub run_once ($kind, $payload_size, $messages) {
+    pin_cpu($receiver_cpu);
     socketpair(my $receiver_fh, my $producer_fh,
         AF_UNIX, SOCK_STREAM, PF_UNSPEC) or die "socketpair: $!";
     pipe(my $barrier_r, my $barrier_w) or die "pipe: $!";
@@ -138,6 +162,7 @@ sub run_once ($kind, $payload_size, $messages) {
     my $pid = fork();
     die "fork: $!" if !defined $pid;
     if ($pid == 0) {
+        pin_cpu($producer_cpu);
         close $receiver_fh;
         close $barrier_w;
         my $go = '';
@@ -177,6 +202,8 @@ sub run_once ($kind, $payload_size, $messages) {
         fh   => $receiver_fh,
         data => $state,
     );
+    Linux::Event::Async::Stream::_recv_profile_start($receiver)
+        if $profile && $kind eq 'async';
 
     my $task;
     if ($kind eq 'async') {
@@ -207,8 +234,11 @@ sub run_once ($kind, $payload_size, $messages) {
     die "$kind delivered $count of $messages messages at size $payload_size\n"
         if $count != $messages;
 
+    my $recv_profile = $profile && $kind eq 'async'
+        ? Linux::Event::Async::Stream::_recv_profile_stats($receiver)
+        : undef;
     $receiver->close if !$receiver->is_closed;
-    return $elapsed;
+    return wantarray ? ($elapsed, $recv_profile) : $elapsed;
 }
 
 my %historical = (
@@ -231,6 +261,8 @@ my %historical = (
 
 say "Linux::Event::Async::Stream receive-path isolation benchmark";
 say "transport=AF_UNIX producer=forked barrier=yes read_size=$READ_SIZE read_budget_bytes=$READ_SIZE framing=native delimiter";
+say 'affinity receiver=' . (defined $receiver_cpu ? $receiver_cpu : 'inherited')
+    . ' producer=' . (defined $producer_cpu ? $producer_cpu : 'inherited');
 printf "%-8s %10s %12s %12s %12s %12s %13s %10s\n",
     qw(payload messages callback manual manual_xs async direct_target retained);
 
@@ -247,7 +279,14 @@ for my $payload_size (@sizes) {
         my $rotation = ($sample - 1) % @kinds;
         my @order = (@kinds[$rotation .. $#kinds], @kinds[0 .. $rotation - 1]);
         for my $kind (@order) {
-            push $samples{$kind}->@*, run_once($kind, $payload_size, $messages);
+            my ($elapsed, $recv_profile) = run_once(
+                $kind, $payload_size, $messages);
+            push $samples{$kind}->@*, $elapsed;
+            if ($recv_profile) {
+                say "profile payload=$payload_size sample=$sample "
+                    . join(' ', map { "$_=$recv_profile->{$_}" }
+                        sort keys $recv_profile->%*);
+            }
         }
     }
 
@@ -269,3 +308,26 @@ for my $payload_size (@sizes) {
             $samples{$kind}->@*);
     }
 }
+
+__END__
+
+=head1 NAME
+
+run-async-stream-native-bench.pl - isolate native Stream receive overhead
+
+=head1 OPTIONS
+
+=over
+
+=item C<--profile>
+
+Enable receive-protocol counters for the measured async samples. The report
+includes FAA readiness checks, suspended awaits, continuation callbacks,
+immediate receives, bounded-prefetch transfers, and native-drain flushes.
+
+=item C<--receiver-cpu=N>, C<--producer-cpu=N>
+
+Pin the benchmark receiver and forked producer to separate Linux CPUs with
+C<taskset>. Affinity is established before the timing barrier.
+
+=back

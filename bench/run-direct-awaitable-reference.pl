@@ -61,11 +61,14 @@ async sub consume_direct ($stream, $target) {
 my $sizes = '2500,35000,200000';
 my $repeat = 7;
 my $warmup = 2;
+my ($receiver_cpu, $producer_cpu);
 
 GetOptions(
     'sizes=s'  => \$sizes,
     'repeat=i' => \$repeat,
     'warmup=i' => \$warmup,
+    'receiver-cpu=i' => \$receiver_cpu,
+    'producer-cpu=i' => \$producer_cpu,
 ) or die "invalid options\n";
 
 die "repeat must be positive\n" if $repeat < 1;
@@ -96,7 +99,26 @@ sub write_all ($fh, $bytes) {
     }
 }
 
+sub pin_cpu ($cpu) {
+    return if !defined $cpu;
+    my $target = $$;
+    my $helper = fork();
+    die "fork affinity helper: $!" if !defined $helper;
+    if ($helper == 0) {
+        open STDOUT, '>', '/dev/null' or _exit(126);
+        open STDERR, '>&', \*STDOUT or _exit(126);
+        {
+            no warnings 'exec';
+            exec 'taskset', '-pc', $cpu, $target;
+            _exit(127);
+        }
+    }
+    waitpid($helper, 0);
+    die "cannot pin process $target to CPU $cpu\n" if $? != 0;
+}
+
 sub run_once ($kind, $payload_size, $messages) {
+    pin_cpu($receiver_cpu);
     socketpair(my $receiver_fh, my $producer_fh,
         AF_UNIX, SOCK_STREAM, PF_UNSPEC) or die "socketpair: $!";
     pipe(my $barrier_r, my $barrier_w) or die "pipe: $!";
@@ -104,6 +126,7 @@ sub run_once ($kind, $payload_size, $messages) {
     my $pid = fork();
     die "fork: $!" if !defined $pid;
     if ($pid == 0) {
+        pin_cpu($producer_cpu);
         close $receiver_fh;
         close $barrier_w;
         my $go = '';
@@ -171,6 +194,8 @@ sub run_once ($kind, $payload_size, $messages) {
 
 say "Historical Direct Awaitable matched reference";
 say "transport=AF_UNIX producer=forked barrier=yes read_size=$READ_SIZE read_budget_bytes=$READ_SIZE framing=native delimiter";
+say 'affinity receiver=' . (defined $receiver_cpu ? $receiver_cpu : 'inherited')
+    . ' producer=' . (defined $producer_cpu ? $producer_cpu : 'inherited');
 printf "%-8s %10s %13s %13s %10s\n",
     qw(payload messages callback direct direct_pct);
 

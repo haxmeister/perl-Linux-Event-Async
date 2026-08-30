@@ -3,6 +3,9 @@
 #include "XSUB.h"
 #include "consumer_abi.h"
 
+#define LEA_PREFETCH_MAX_MESSAGES 64U
+#define LEA_PREFETCH_MAX_BYTES 262144U
+
 typedef struct lea_recv_ctx_s {
     const les_consumer_host_api_v1_t *host;
     void *host_context;
@@ -12,12 +15,31 @@ typedef struct lea_recv_ctx_s {
     SV *terminal_failure;
     SV *on_ready;
     SV *on_cancel;
+    SV *prefetch[LEA_PREFETCH_MAX_MESSAGES];
+    UV prefetch_bytes;
+    unsigned int prefetch_head;
+    unsigned int prefetch_count;
     int armed;
     int ready;
     int cancelled;
     int in_delivery;
     int terminal;
+    int flush_pending;
+    int profile;
+    unsigned long long profile_recv_calls;
+    unsigned long long profile_recv_immediate;
+    unsigned long long profile_messages;
+    unsigned long long profile_ready_callbacks;
+    unsigned long long profile_await_is_ready;
+    unsigned long long profile_await_get;
+    unsigned long long profile_await_on_ready;
+    unsigned long long profile_await_suspended;
+    unsigned long long profile_prefetched;
+    unsigned long long profile_flushes;
 } lea_recv_ctx_t;
+
+#define LEA_PROFILE(ctx, field) \
+    STMT_START { if ((ctx)->profile) (ctx)->field++; } STMT_END
 
 #define LEA_CTX_KEY "_linux_event_async_recv_ctx"
 #define LEA_CTX_KEY_LEN (sizeof(LEA_CTX_KEY) - 1)
@@ -76,6 +98,46 @@ lea_clear_sv(SV **slot)
     }
 }
 
+static void
+lea_prefetch_push(lea_recv_ctx_t *ctx, SV *message)
+{
+    unsigned int tail;
+    UV bytes = (UV)SvCUR(message);
+
+    if (ctx->prefetch_count >= LEA_PREFETCH_MAX_MESSAGES)
+        croak("Linux::Event::Async receive prefetch ring overflow");
+    tail = (ctx->prefetch_head + ctx->prefetch_count)
+        % LEA_PREFETCH_MAX_MESSAGES;
+    ctx->prefetch[tail] = SvREFCNT_inc(message);
+    ctx->prefetch_count++;
+    if (bytes > (UV)-1 - ctx->prefetch_bytes)
+        ctx->prefetch_bytes = (UV)-1;
+    else
+        ctx->prefetch_bytes += bytes;
+    LEA_PROFILE(ctx, profile_prefetched);
+}
+
+static SV *
+lea_prefetch_shift(lea_recv_ctx_t *ctx)
+{
+    SV *message;
+    UV bytes;
+
+    if (!ctx->prefetch_count)
+        return NULL;
+    message = ctx->prefetch[ctx->prefetch_head];
+    ctx->prefetch[ctx->prefetch_head] = NULL;
+    ctx->prefetch_head = (ctx->prefetch_head + 1)
+        % LEA_PREFETCH_MAX_MESSAGES;
+    ctx->prefetch_count--;
+    bytes = (UV)SvCUR(message);
+    ctx->prefetch_bytes = bytes > ctx->prefetch_bytes
+        ? 0 : ctx->prefetch_bytes - bytes;
+    if (!ctx->prefetch_count)
+        ctx->prefetch_head = 0;
+    return message;
+}
+
 static SV *
 lea_error_new(uint32_t event, int error, const char *message)
 {
@@ -124,8 +186,10 @@ lea_fire_ready(pTHX_ lea_recv_ctx_t *ctx)
 {
     SV *callback = ctx->on_ready;
     ctx->on_ready = NULL;
-    if (callback)
+    if (callback) {
+        LEA_PROFILE(ctx, profile_ready_callbacks);
         lea_call_owned(aTHX_ ctx, callback);
+    }
 }
 
 static void
@@ -169,8 +233,19 @@ lea_consumer_message(pTHX_ void *context, SV *message)
 {
     lea_recv_ctx_t *ctx = (lea_recv_ctx_t *)context;
 
-    if (!ctx->armed)
-        return LES_CONSUMER_PAUSE;
+    LEA_PROFILE(ctx, profile_messages);
+
+    if (!ctx->armed) {
+        lea_prefetch_push(ctx, message);
+        if (ctx->prefetch_count >= LEA_PREFETCH_MAX_MESSAGES
+            || ctx->prefetch_bytes >= LEA_PREFETCH_MAX_BYTES) {
+            ctx->flush_pending = 0;
+            LEA_PROFILE(ctx, profile_flushes);
+            lea_fire_ready(aTHX_ ctx);
+            return ctx->armed ? LES_CONSUMER_CONTINUE : LES_CONSUMER_PAUSE;
+        }
+        return LES_CONSUMER_CONTINUE;
+    }
 
     lea_clear_sv(&ctx->result);
     lea_clear_sv(&ctx->failure);
@@ -178,8 +253,21 @@ lea_consumer_message(pTHX_ void *context, SV *message)
     ctx->armed = 0;
     ctx->ready = 1;
     ctx->cancelled = 0;
+    ctx->flush_pending = 1;
 
-    lea_fire_ready(aTHX_ ctx);
+    return LES_CONSUMER_CONTINUE;
+}
+
+static int
+lea_consumer_flush(pTHX_ void *context)
+{
+    lea_recv_ctx_t *ctx = (lea_recv_ctx_t *)context;
+
+    if (ctx->flush_pending) {
+        ctx->flush_pending = 0;
+        LEA_PROFILE(ctx, profile_flushes);
+        lea_fire_ready(aTHX_ ctx);
+    }
     return ctx->armed ? LES_CONSUMER_CONTINUE : LES_CONSUMER_PAUSE;
 }
 
@@ -225,6 +313,10 @@ lea_consumer_destroy(pTHX_ void *context)
     lea_clear_sv(&ctx->terminal_failure);
     lea_clear_sv(&ctx->on_ready);
     lea_clear_sv(&ctx->on_cancel);
+    while (ctx->prefetch_count) {
+        SV *message = lea_prefetch_shift(ctx);
+        SvREFCNT_dec(message);
+    }
     if (ctx->awaitable) {
         sv_setuv(SvRV(ctx->awaitable), 0);
         SvREFCNT_dec(ctx->awaitable);
@@ -237,11 +329,12 @@ static const les_consumer_ops_v1_t lea_consumer_ops = {
     LES_CONSUMER_ABI_VERSION,
     sizeof(les_consumer_ops_v1_t),
     "Linux::Event::Async::Stream",
-    LES_CONSUMER_F_START_PAUSED,
+    LES_CONSUMER_F_START_PAUSED | LES_CONSUMER_F_WANT_FLUSH,
     lea_consumer_create,
     lea_consumer_message,
     lea_consumer_event,
-    lea_consumer_destroy
+    lea_consumer_destroy,
+    lea_consumer_flush
 };
 
 static lea_recv_ctx_t *
@@ -249,6 +342,8 @@ lea_recv_arm(pTHX_ SV *stream)
 {
     lea_recv_ctx_t *ctx = lea_get_ctx(stream);
     int status;
+
+    LEA_PROFILE(ctx, profile_recv_calls);
 
     if (ctx->armed)
         croak("recv(): a receive is already pending");
@@ -258,6 +353,13 @@ lea_recv_arm(pTHX_ SV *stream)
     ctx->cancelled = 0;
     lea_clear_sv(&ctx->on_ready);
     lea_clear_sv(&ctx->on_cancel);
+
+    if (ctx->prefetch_count) {
+        ctx->result = lea_prefetch_shift(ctx);
+        ctx->ready = 1;
+        LEA_PROFILE(ctx, profile_recv_immediate);
+        return ctx;
+    }
 
     if (ctx->terminal) {
         lea_prepare_terminal_result(ctx);
@@ -281,6 +383,8 @@ lea_recv_arm(pTHX_ SV *stream)
             lea_prepare_terminal_result(ctx);
         }
     }
+    if (ctx->ready)
+        LEA_PROFILE(ctx, profile_recv_immediate);
     return ctx;
 }
 
@@ -291,6 +395,48 @@ UV
 _consumer_operations_address()
     CODE:
         RETVAL = PTR2UV(&lea_consumer_ops);
+    OUTPUT:
+        RETVAL
+
+void
+_recv_profile_start(stream)
+    SV *stream
+    PREINIT:
+        lea_recv_ctx_t *ctx;
+    CODE:
+        ctx = lea_get_ctx(stream);
+        ctx->profile = 1;
+        ctx->profile_recv_calls = 0;
+        ctx->profile_recv_immediate = 0;
+        ctx->profile_messages = 0;
+        ctx->profile_ready_callbacks = 0;
+        ctx->profile_await_is_ready = 0;
+        ctx->profile_await_get = 0;
+        ctx->profile_await_on_ready = 0;
+        ctx->profile_await_suspended = 0;
+        ctx->profile_prefetched = 0;
+        ctx->profile_flushes = 0;
+
+SV *
+_recv_profile_stats(stream)
+    SV *stream
+    PREINIT:
+        lea_recv_ctx_t *ctx;
+        HV *hv;
+    CODE:
+        ctx = lea_get_ctx(stream);
+        hv = newHV();
+        hv_stores(hv, "recv_calls", newSVuv(ctx->profile_recv_calls));
+        hv_stores(hv, "recv_immediate", newSVuv(ctx->profile_recv_immediate));
+        hv_stores(hv, "messages", newSVuv(ctx->profile_messages));
+        hv_stores(hv, "ready_callbacks", newSVuv(ctx->profile_ready_callbacks));
+        hv_stores(hv, "await_is_ready", newSVuv(ctx->profile_await_is_ready));
+        hv_stores(hv, "await_get", newSVuv(ctx->profile_await_get));
+        hv_stores(hv, "await_on_ready", newSVuv(ctx->profile_await_on_ready));
+        hv_stores(hv, "await_suspended", newSVuv(ctx->profile_await_suspended));
+        hv_stores(hv, "prefetched", newSVuv(ctx->profile_prefetched));
+        hv_stores(hv, "flushes", newSVuv(ctx->profile_flushes));
+        RETVAL = newRV_noinc((SV *)hv);
     OUTPUT:
         RETVAL
 
@@ -424,6 +570,7 @@ AWAIT_IS_READY(awaitable)
         lea_recv_ctx_t *ctx;
     CODE:
         ctx = lea_awaitable_ctx(awaitable);
+        LEA_PROFILE(ctx, profile_await_is_ready);
         RETVAL = ctx->ready || ctx->cancelled;
     OUTPUT:
         RETVAL
@@ -445,6 +592,7 @@ AWAIT_GET(awaitable)
         SV *failure;
     CODE:
         ctx = lea_awaitable_ctx(awaitable);
+        LEA_PROFILE(ctx, profile_await_get);
         if (ctx->cancelled)
             croak("cannot get a cancelled receive");
         if (!ctx->ready)
@@ -470,12 +618,14 @@ AWAIT_ON_READY(awaitable, code)
         lea_recv_ctx_t *ctx;
     CODE:
         ctx = lea_awaitable_ctx(awaitable);
+        LEA_PROFILE(ctx, profile_await_on_ready);
         if (!SvROK(code) || SvTYPE(SvRV(code)) != SVt_PVCV)
             croak("AWAIT_ON_READY requires a coderef");
         if (ctx->ready || ctx->cancelled) {
             lea_call_owned(aTHX_ ctx, SvREFCNT_inc(code));
         }
         else {
+            LEA_PROFILE(ctx, profile_await_suspended);
             lea_clear_sv(&ctx->on_ready);
             ctx->on_ready = SvREFCNT_inc(code);
         }
