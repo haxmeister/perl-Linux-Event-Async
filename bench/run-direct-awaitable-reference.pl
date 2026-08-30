@@ -7,15 +7,18 @@ use Getopt::Long qw(GetOptions);
 use POSIX qw(_exit);
 use Socket qw(AF_UNIX SOCK_STREAM PF_UNSPEC);
 use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC);
+use XSLoader;
 
+use Linux::Event;
 use Linux::Event::Loop;
 use Linux::Event::Stream;
-use Linux::Event::Async;
+
+XSLoader::load('Linux::Event::DirectAwaitable', $Linux::Event::VERSION);
 
 our $READ_SIZE = 262_144;
 
 {
-    package LEA::Bench::Callback;
+    package LEA::Reference::Callback;
     use parent 'Linux::Event::Stream';
     use Linux::Event::Framer 'Delimiter', "\n";
 
@@ -33,8 +36,8 @@ our $READ_SIZE = 262_144;
 }
 
 {
-    package LEA::Bench::Async;
-    use parent 'Linux::Event::Async::Stream';
+    package LEA::Reference::Direct;
+    use parent 'Linux::Event::Stream';
     use Linux::Event::Framer 'Delimiter', "\n";
 
     sub stream_options ($class) {
@@ -43,53 +46,16 @@ our $READ_SIZE = 262_144;
     }
 }
 
-async sub consume_async ($stream, $target) {
+async sub consume_direct ($stream, $target) {
     my $count = 0;
     while ($count < $target) {
-        my $message = await $stream->recv;
+        my $awaitable = Linux::Event::DirectAwaitable->_recv_stream_state(
+            $stream->{xs_state});
+        my $message = await $awaitable;
         die "unexpected EOF after $count messages" if !defined $message;
         $count++;
     }
     return $count;
-}
-
-sub consume_manual ($stream, $state) {
-    my $ready;
-    my $awaitable;
-    $ready = sub {
-        my $message = $awaitable->AWAIT_GET;
-        die "unexpected EOF after $state->{count} messages" if !defined $message;
-        $state->{count}++;
-        if ($state->{count} == $state->{target}) {
-            $state->{loop}->stop;
-            return;
-        }
-        $awaitable = $stream->recv;
-        $awaitable->AWAIT_ON_READY($ready);
-        return;
-    };
-    $awaitable = $stream->recv;
-    $awaitable->AWAIT_ON_READY($ready);
-    return;
-}
-
-sub consume_manual_xs ($stream, $state) {
-    my $ready;
-    $ready = sub {
-        my $message = Linux::Event::Async::Stream::_recv_get($stream);
-        die "unexpected EOF after $state->{count} messages" if !defined $message;
-        $state->{count}++;
-        if ($state->{count} == $state->{target}) {
-            $state->{loop}->stop;
-            return;
-        }
-        Linux::Event::Async::Stream::_recv_arm($stream);
-        Linux::Event::Async::Stream::_recv_on_ready($stream, $ready);
-        return;
-    };
-    Linux::Event::Async::Stream::_recv_arm($stream);
-    Linux::Event::Async::Stream::_recv_on_ready($stream, $ready);
-    return;
 }
 
 my $sizes = '2500,35000,200000';
@@ -171,23 +137,14 @@ sub run_once ($kind, $payload_size, $messages) {
         target => $messages,
     };
     my $class = $kind eq 'callback'
-        ? 'LEA::Bench::Callback' : 'LEA::Bench::Async';
+        ? 'LEA::Reference::Callback' : 'LEA::Reference::Direct';
     my $receiver = $class->new(
         loop => $loop,
         fh   => $receiver_fh,
         data => $state,
     );
-
-    my $task;
-    if ($kind eq 'async') {
-        $task = consume_async($receiver, $messages);
-    }
-    elsif ($kind eq 'manual') {
-        consume_manual($receiver, $state);
-    }
-    elsif ($kind eq 'manual_xs') {
-        consume_manual_xs($receiver, $state);
-    }
+    my $task = $kind eq 'direct'
+        ? consume_direct($receiver, $messages) : undef;
 
     my $started = clock_gettime(CLOCK_MONOTONIC);
     syswrite($barrier_w, 'G') == 1 or die "barrier release: $!";
@@ -195,8 +152,9 @@ sub run_once ($kind, $payload_size, $messages) {
 
     my $count;
     if ($task) {
-        $count = $task->AWAIT_WAIT;
-    } else {
+        $count = $loop->run($task);
+    }
+    else {
         $loop->run;
         $count = $state->{count};
     }
@@ -211,32 +169,14 @@ sub run_once ($kind, $payload_size, $messages) {
     return $elapsed;
 }
 
-my %historical = (
-    2500 => {
-        callback => 924_262,
-        stream_awaitable => 170_677,
-        direct_awaitable => 533_964,
-    },
-    35000 => {
-        callback => 119_449,
-        stream_awaitable => 86_258,
-        direct_awaitable => 120_209,
-    },
-    200000 => {
-        callback => 20_948,
-        stream_awaitable => 22_780,
-        direct_awaitable => 24_061,
-    },
-);
-
-say "Linux::Event::Async::Stream receive-path isolation benchmark";
+say "Historical Direct Awaitable matched reference";
 say "transport=AF_UNIX producer=forked barrier=yes read_size=$READ_SIZE read_budget_bytes=$READ_SIZE framing=native delimiter";
-printf "%-8s %10s %12s %12s %12s %12s %13s %10s\n",
-    qw(payload messages callback manual manual_xs async direct_target retained);
+printf "%-8s %10s %13s %13s %10s\n",
+    qw(payload messages callback direct direct_pct);
 
 for my $payload_size (@sizes) {
     my $messages = messages_for_size($payload_size);
-    my @kinds = qw(callback manual manual_xs async);
+    my @kinds = qw(callback direct);
 
     for (1 .. $warmup) {
         run_once($_, $payload_size, $messages) for @kinds;
@@ -244,8 +184,7 @@ for my $payload_size (@sizes) {
 
     my %samples = map { $_ => [] } @kinds;
     for my $sample (1 .. $repeat) {
-        my $rotation = ($sample - 1) % @kinds;
-        my @order = (@kinds[$rotation .. $#kinds], @kinds[0 .. $rotation - 1]);
+        my @order = $sample % 2 ? @kinds : reverse @kinds;
         for my $kind (@order) {
             push $samples{$kind}->@*, run_once($kind, $payload_size, $messages);
         }
@@ -254,14 +193,10 @@ for my $payload_size (@sizes) {
     my %rate = map {
         $_ => $messages / median($samples{$_}->@*)
     } @kinds;
-    my $old = $historical{$payload_size}
-        or die "no historical comparison for payload $payload_size\n";
-    my $retained = 100 * $rate{async} / $old->{direct_awaitable};
 
-    printf "%-8d %10d %12.0f %12.0f %12.0f %12.0f %13d %9.1f%%\n",
-        $payload_size, $messages,
-        @rate{qw(callback manual manual_xs async)},
-        $old->{direct_awaitable}, $retained;
+    printf "%-8d %10d %13.0f %13.0f %9.1f%%\n",
+        $payload_size, $messages, $rate{callback}, $rate{direct},
+        100 * $rate{direct} / $rate{callback};
 
     say "samples payload=$payload_size";
     for my $kind (@kinds) {

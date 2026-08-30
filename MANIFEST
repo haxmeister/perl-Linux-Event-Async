@@ -12,3 +12,5 @@ t/00-load.t
 t/01-future.t
 t/02-awaitable.t
 t/10-stream.t
+xsfuture/Future.xs
+xsfuture/Makefile.PL

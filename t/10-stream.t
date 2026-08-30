@@ -25,18 +25,32 @@ sub pair () {
 {
     my ($loop, $stream, $peer) = pair();
     my $recv = $stream->recv;
-    is(refaddr($recv), refaddr($stream), 'recv returns the reusable Stream awaitable');
+    isa_ok($recv, 'Linux::Event::Async::Stream::Awaitable');
+    isnt(refaddr($recv), refaddr($stream),
+        'recv returns a native Awaitable view, not the Stream hash');
     ok(!$recv->AWAIT_IS_READY, 'receive starts pending');
+    my $pending_error = eval { $stream->recv; 1 } ? '' : $@;
+    like($pending_error, qr/a receive is already pending/,
+        'a second receive cannot overlap the current generation');
 
-    $recv->AWAIT_ON_READY(sub { $loop->stop });
+    my $first_ready = 0;
+    $recv->AWAIT_ON_READY(sub { $first_ready++; $loop->stop });
     syswrite($peer, "one\ntwo\n") == 8 or die "short write: $!";
     $loop->run;
     ok($recv->AWAIT_IS_READY, 'first framed message makes receive ready');
+    is($first_ready, 1, 'first-generation ready callback fires once');
+    my $unconsumed_error = eval { $stream->recv; 1 } ? '' : $@;
+    like($unconsumed_error, qr/previous receive result has not been consumed/,
+        'next generation cannot start before the result is consumed');
     is($recv->AWAIT_GET, 'one', 'first framed message is returned');
 
     my $second = $stream->recv;
+    is(refaddr($second), refaddr($recv),
+        'recv reuses one persistent Awaitable view');
     ok($second->AWAIT_IS_READY,
         'buffered second frame completes synchronously when receive is rearmed');
+    is($first_ready, 1,
+        'callback from the prior generation is not reused');
     is($second->AWAIT_GET, 'two', 'second framed message preserves order');
 
     $stream->close;
@@ -108,7 +122,7 @@ sub pair () {
     my $future = wait_one($stream);
     $future->cancel;
     ok($future->AWAIT_IS_CANCELLED, 'async-sub result can be cancelled');
-    ok($stream->recv->AWAIT_IS_READY == 0,
+    ok(!$stream->recv->AWAIT_IS_READY,
         'cancelling async-sub result releases the pending Stream receive');
     $stream->cancel_recv;
 

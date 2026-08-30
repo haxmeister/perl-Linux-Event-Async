@@ -13,6 +13,13 @@ jobs:
         with:
           path: async
 
+      - name: Check out historical Direct Awaitable
+        uses: actions/checkout@v4
+        with:
+          repository: haxmeister/perl-linux-event
+          ref: experiment/direct-awaitable
+          path: direct-event
+
       - name: Check out Linux::Event main
         uses: actions/checkout@v4
         with:
@@ -28,8 +35,21 @@ jobs:
       - name: Install build dependencies
         run: |
           cpanm --notest Future::AsyncAwait
-          cd linux-event
+          cd direct-event
           cpanm --notest --installdeps .
+          cd ../linux-event
+          cpanm --notest --installdeps .
+
+      - name: Build historical Direct Awaitable
+        run: |
+          cd direct-event
+          perl Makefile.PL
+          make -j2
+
+      - name: Benchmark historical Direct Awaitable
+        run: |
+          cd direct-event
+          perl -Mblib ../async/bench/run-direct-awaitable-reference.pl --repeat=7 --warmup=2
 
       - name: Build and install Linux::Event main
         run: |

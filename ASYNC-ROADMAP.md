@@ -100,6 +100,31 @@ at 35 KB, and approximately 6% faster at 200 KB.
 The target architecture is therefore a Direct Awaitable built through a generic
 native consumer capability, not a Future-first reactor.
 
+### Async Stream performance recapture
+
+The first implementation benchmark isolated the remaining small-message loss
+to the Future::AsyncAwait boundary rather than the consumer ABI. At 2,500-byte
+payloads, the native consumer driven manually through its XSUBs exceeded one
+million messages per second while the initial async loop reached 342,589
+messages per second.
+
+The optimization sequence retained one native Awaitable view per Stream and
+then moved public `recv` into XS. Separate position-rotated runs measured:
+
+| 2,500-byte receive path | Median msg/s | Historical Direct retained |
+|---|---:|---:|
+| Initial reusable Stream Awaitable | 342,589 | 64.2% |
+| Persistent native Awaitable view | 362,164 | 67.8% |
+| Native view plus XS `recv` | 416,817-456,923 | 78.1-85.6% |
+
+The runs showed substantial host scheduling variance, so these figures are
+stage evidence rather than release claims. The matched three-payload benchmark
+remains the acceptance tool. Repeated cancellation chaining to the persistent
+view uses one native target slot and deduplicates the common case. This bounds
+retained cancellation state across long receive loops without weakening
+cancellation of the currently armed receive; distinct explicit targets remain
+supported through an overflow array.
+
 ## Distribution responsibilities
 
 ### Linux::Event
@@ -272,11 +297,10 @@ Application code should use:
 my $message = await $stream->recv;
 ```
 
-`recv` arms one reusable receive and returns the Stream's Awaitable view.
-Whether that view is literally the same blessed Stream scalar or a stable,
-allocation-free XS view must be decided by conformance and benchmark evidence.
-A separately allocated operation per message is not acceptable for the primary
-fast path.
+`recv` arms one reusable receive in XS and returns a stable native Awaitable
+view whose scalar contains the receive-context pointer directly. Each Stream
+creates that view once. A separately allocated operation per message is not
+acceptable for the primary fast path.
 
 Required Awaitable behavior includes:
 
@@ -292,9 +316,11 @@ Required Awaitable behavior includes:
 `AWAIT_CLONE` returns `Linux::Event::Async::Future`, not another Stream.
 That Future represents the whole async sub.
 
-Repeated or stale access must not observe a later receive. If returning the
-Stream itself cannot satisfy Future::AsyncAwait's conformance expectations,
-the design must use a generation-safe view and remeasure its cost.
+Future::AsyncAwait receive generations are serialized: a second receive cannot
+overlap a pending generation or start before the ready result is consumed, and
+the ready callback is detached before coroutine resumption. This prevents an
+old await continuation from firing for a later receive while allowing the
+native view itself to remain persistent.
 
 ## Receive semantics
 

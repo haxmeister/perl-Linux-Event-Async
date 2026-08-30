@@ -4,11 +4,11 @@
 Future::AsyncAwait-compatible async/await support above Linux::Event.
 
 The initial implementation concentrates on `Linux::Event::Async::Stream`.
-A framed Stream owns one reusable native receive Awaitable. Calling `recv`
-arms that state and returns the Stream itself; receiving a message does not
-allocate a Future. The Future allocated by Future::AsyncAwait represents the
-result of the entire `async sub` and is implemented by
-`Linux::Event::Async::Future`.
+A framed Stream owns one persistent native receive Awaitable view. Calling
+`recv` arms the receive context in XS and returns that same view; receiving a
+message does not allocate a Future or Awaitable. The Future allocated by
+Future::AsyncAwait represents the result of the entire `async sub` and is
+implemented by `Linux::Event::Async::Future`.
 
 ```perl
 package LineStream;
