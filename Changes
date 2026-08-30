@@ -1,0 +1,10 @@
+Revision history for Linux-Event-Async
+
+0.001_001  2026-08-30
+    - Initial development skeleton for the separate Linux::Event::Async
+      distribution.
+    - Add Linux::Event::Async import wrapper for Future::AsyncAwait.
+    - Add Linux::Event::Async::Stream reusable receive Awaitable using the
+      Linux::Event native Stream consumer ABI.
+    - Add Linux::Event::Async::Future for async-sub result Futures.
+    - Vendor the Linux::Event consumer ABI v1 header.
