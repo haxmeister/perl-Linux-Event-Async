@@ -318,7 +318,8 @@ lea_consumer_destroy(pTHX_ void *context)
         SvREFCNT_dec(message);
     }
     if (ctx->awaitable) {
-        sv_setuv(SvRV(ctx->awaitable), 0);
+        if (SvROK(ctx->awaitable) && SvRV(ctx->awaitable))
+            sv_setuv(SvRV(ctx->awaitable), 0);
         SvREFCNT_dec(ctx->awaitable);
         ctx->awaitable = NULL;
     }
