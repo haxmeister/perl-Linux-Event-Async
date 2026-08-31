@@ -12,5 +12,7 @@ t/00-load.t
 t/01-future.t
 t/02-awaitable.t
 t/10-stream.t
+t/20-concurrency.t
+t/21-global-destruction.t
 xsfuture/Future.xs
 xsfuture/Makefile.PL

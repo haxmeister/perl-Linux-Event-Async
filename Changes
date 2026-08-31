@@ -1,5 +1,17 @@
 Revision history for Linux-Event-Async
 
+    - Add concurrency regression coverage for multiple async subs sharing one
+      Loop, out-of-order completion, isolated failure and cancellation, and the
+      single-reader-per-Stream contract.
+    - Follow the currently awaited Linux::Event Loop when an async sub composes
+      sequential operations across different Loops, including through nested
+      child async subs, preventing AWAIT_WAIT from remaining blocked on an
+      earlier Loop.
+    - Make native consumer teardown safe when Perl global destruction has
+      already invalidated the persistent Stream Awaitable referent.
+    - Document that Loop run continues until stop and does not infer completion
+      from async-sub Futures.
+
 0.001_001  2026-08-30
     - Initial development skeleton for the separate Linux::Event::Async
       distribution.

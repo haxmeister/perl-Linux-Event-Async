@@ -187,13 +187,109 @@ leaf_same_cancel_target(SV *left, SV *right)
     return SvROK(left) && SvROK(right) && SvRV(left) == SvRV(right);
 }
 
+static SV *
+leaf_stream_awaitable_loop(pTHX_ SV *target)
+{
+    dSP;
+    SV *stream;
+    SV *returned;
+    SV *loop = NULL;
+
+    ENTER;
+    SAVETMPS;
+
+    PUSHMARK(SP);
+    PUSHs(target);
+    PUTBACK;
+    call_method("_stream", G_SCALAR);
+    SPAGAIN;
+    stream = POPs;
+    SvREFCNT_inc(stream);
+    PUTBACK;
+
+    PUSHMARK(SP);
+    PUSHs(stream);
+    PUTBACK;
+    call_method("loop", G_SCALAR);
+    SPAGAIN;
+    returned = POPs;
+    if (SvOK(returned))
+        loop = newSVsv(returned);
+    PUTBACK;
+
+    SvREFCNT_dec(stream);
+    FREETMPS;
+    LEAVE;
+    return loop;
+}
+
+static SV *leaf_effective_loop(pTHX_ leaf_future_t *future, unsigned int depth);
+
+static SV *
+leaf_target_loop(pTHX_ SV *target, unsigned int depth)
+{
+    leaf_future_t *target_future;
+
+    if (sv_derived_from(target, "Linux::Event::Async::Future")) {
+        target_future = leaf_from_sv(target);
+        return leaf_effective_loop(aTHX_ target_future, depth + 1);
+    }
+    if (sv_derived_from(target,
+            "Linux::Event::Async::Stream::Awaitable"))
+        return leaf_stream_awaitable_loop(aTHX_ target);
+    return NULL;
+}
+
+static SV *
+leaf_effective_loop(pTHX_ leaf_future_t *future, unsigned int depth)
+{
+    SV *target = future->cancel_target;
+    SV *loop;
+    SSize_t count;
+    SV **last;
+
+    if (depth > 64)
+        croak("Linux::Event::Async Future loop dependency is cyclic");
+    if (future->cancel_chain) {
+        count = av_count(future->cancel_chain);
+        last = count ? av_fetch(future->cancel_chain, count - 1, 0) : NULL;
+        if (last && *last)
+            target = *last;
+    }
+    if (target
+        && sv_derived_from(target, "Linux::Event::Async::Future")) {
+        loop = leaf_target_loop(aTHX_ target, depth);
+        if (loop)
+            return loop;
+    }
+    return future->loop_sv ? newSVsv(future->loop_sv) : NULL;
+}
+
 static void
-leaf_add_cancel_target(leaf_future_t *future, SV *target)
+leaf_follow_target_loop(pTHX_ leaf_future_t *future, SV *target)
+{
+    SV *loop = leaf_target_loop(aTHX_ target, 0);
+
+    if (!loop)
+        return;
+    if (future->loop_sv && SvROK(future->loop_sv) && SvROK(loop)
+        && SvRV(future->loop_sv) == SvRV(loop)) {
+        SvREFCNT_dec(loop);
+        return;
+    }
+    if (future->loop_sv)
+        SvREFCNT_dec(future->loop_sv);
+    future->loop_sv = loop;
+}
+
+static void
+leaf_add_cancel_target(pTHX_ leaf_future_t *future, SV *target)
 {
     SSize_t count;
     SV **last;
 
     if (!future->cancel_target) {
+        leaf_follow_target_loop(aTHX_ future, target);
         future->cancel_target = newSVsv(target);
         return;
     }
@@ -205,6 +301,7 @@ leaf_add_cancel_target(leaf_future_t *future, SV *target)
     last = count ? av_fetch(future->cancel_chain, count - 1, 0) : NULL;
     if (last && *last && leaf_same_cancel_target(*last, target))
         return;
+    leaf_follow_target_loop(aTHX_ future, target);
     av_push(future->cancel_chain, newSVsv(target));
 }
 
@@ -485,7 +582,7 @@ AWAIT_CHAIN_CANCEL(future_obj, target)
             if (failure)
                 croak_sv(sv_2mortal(failure));
         } else if (future->state == LEAF_PENDING) {
-            leaf_add_cancel_target(future, target);
+            leaf_add_cancel_target(aTHX_ future, target);
         }
 
 SV *
@@ -535,7 +632,9 @@ loop(future_obj)
         leaf_future_t *future;
     CODE:
         future = leaf_from_sv(future_obj);
-        RETVAL = future->loop_sv ? newSVsv(future->loop_sv) : &PL_sv_undef;
+        RETVAL = leaf_effective_loop(aTHX_ future, 0);
+        if (!RETVAL)
+            RETVAL = &PL_sv_undef;
     OUTPUT:
         RETVAL
 
