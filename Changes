@@ -1,5 +1,9 @@
 Revision history for Linux-Event-Async
 
+    - Add deterministic stress coverage for many concurrent tasks, shuffled
+      readiness, mixed failures and cancellations, stale completed Futures,
+      nested cancellation, and closing Streams with pending receives.
+
     - Add concurrency regression coverage for multiple async subs sharing one
       Loop, out-of-order completion, isolated failure and cancellation, and the
       single-reader-per-Stream contract.
