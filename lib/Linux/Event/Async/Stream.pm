@@ -3,16 +3,17 @@ use v5.36;
 use strict;
 use warnings;
 
-use parent 'Linux::Event::Stream';
+use parent 'Linux::Event::IO::Sock::Stream';
 use Carp qw(croak);
 use Linux::Event::Async::Future ();
+use Linux::Event::Framer ();
 
 our $VERSION = '0.001_001';
 
 require XSLoader;
 XSLoader::load('Linux::Event::Async', $VERSION);
 
-Linux::Event::Stream->_declare_consumer(
+Linux::Event::Framer->declare_native_consumer(
     __PACKAGE__,
     {
         provider           => \&_consumer_operations_address,
@@ -72,20 +73,23 @@ Linux::Event::Async::Stream - reusable receive awaitable for Linux::Event
 
 =head1 DESCRIPTION
 
-Each Stream owns one native receive context and one persistent native Awaitable
-view supplied through Linux::Event's versioned framed-message consumer ABI.
-C<recv> arms that context and returns the same Awaitable view each time. No
-Future or Awaitable is allocated per received message.
+C<Linux::Event::Async::Stream> extends the public
+L<Linux::Event::IO::Sock::Stream> leaf with one reusable native receive
+context and one persistent native Awaitable view. The integration uses
+Linux::Event's ordered-byte native-consumer ABI rather than a retired Stream
+implementation class.
 
-Only one receive may be active. Clean EOF resolves to C<undef>. Cancelling a
-pending receive pauses consumer delivery without closing the Stream or consuming
-the next message.
+C<recv> arms the receive context and returns the same Awaitable view each time.
+No Future or Awaitable is allocated per received message. Only one receive may
+be active. Clean EOF resolves to C<undef>. Cancelling a pending receive pauses
+consumer delivery without closing the connection or consuming the next
+message.
 
 Within one native input drain, the consumer may retain up to 64 additional
 messages and approximately 256 KiB of payload before waking the pending
 receive. The byte boundary permits one complete-frame overshoot. This bounded
-prefetch makes consecutive receives immediately ready while preserving Stream
-pause and kernel backpressure when the coroutine stops consuming.
+prefetch makes consecutive receives immediately ready while preserving kernel
+backpressure when the coroutine stops consuming.
 
 A concrete subclass must declare a built-in native framer. Callback delivery
 through C<on_message> or C<on_messages> cannot be mixed with this consumer.
