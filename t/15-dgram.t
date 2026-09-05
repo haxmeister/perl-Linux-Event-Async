@@ -120,12 +120,12 @@ sub close_dgram ($socket) {
 
     my $client = T::AsyncDgram->connect(
         loop => $loop,
-        host => 'localhost',
+        host => '127.0.0.1',
         port => $server->local->port,
     );
     $client->ready->AWAIT_WAIT;
     ok($client->is_connected,
-        'connected Async Datagram reaches application readiness after resolver');
+        'connected Async Datagram reaches application readiness');
 
     ok($client->send('one'), 'first UDP packet sends');
     ok($client->send('two'), 'second UDP packet sends');
