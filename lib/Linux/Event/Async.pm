@@ -8,6 +8,7 @@ our $VERSION = '0.002';
 use Future::AsyncAwait 0.71 ();
 use Linux::Event::Async::Future ();
 use Linux::Event::Async::Stream ();
+use Linux::Event::Async::Listener ();
 
 sub import {
     @_ = ('Future::AsyncAwait', future_class => 'Linux::Event::Async::Future');
@@ -33,20 +34,24 @@ Linux::Event::Async - async/await integration for Linux::Event
   use Linux::Event::Loop;
 
   my $loop = Linux::Event::Loop->new;
-  my $stream = LineStream->connect(
-      loop => $loop,
-      host => '127.0.0.1',
-      port => 9999,
+  my $listener = Linux::Event::Async::Listener->new(
+      loop         => $loop,
+      stream_class => 'LineStream',
+      host         => '127.0.0.1',
+      port         => 9999,
   );
 
-  async sub consume ($stream) {
-      await $stream->ready;
-      while (defined(my $message = await $stream->recv)) {
-          say $message;
+  async sub serve ($listener) {
+      while (1) {
+          my $stream = await $listener->accept;
+          await $stream->ready;
+          while (defined(my $message = await $stream->recv)) {
+              say $message;
+          }
       }
   }
 
-  my $task = consume($stream);
+  my $task = serve($listener);
   $task->AWAIT_WAIT;
 
 =head1 DESCRIPTION
@@ -59,20 +64,20 @@ Importing this module installs C<async> and C<await> through
 L<Future::AsyncAwait> and selects L<Linux::Event::Async::Future> as the Future
 class used for C<async sub> results.
 
-The first stable release covers two Stream suspension patterns. Application
-readiness is a cold one-shot lifecycle operation and C<< $stream->ready >>
-returns an ordinary L<Linux::Event::Async::Future>. Framed receive is a hot
-repeated operation, so L<Linux::Event::Async::Stream> owns one persistent native
-receive Awaitable; C<recv> does not allocate one Future or Awaitable per
-message.
+The first stable release covers three suspension patterns. Application readiness
+is a cold one-shot lifecycle operation and C<< $stream->ready >> returns an
+ordinary L<Linux::Event::Async::Future>. Framed Stream receive and Listener
+accept are hot repeated operations and use persistent per-resource Awaitable
+views, avoiding one Future or Awaitable allocation for each message or accepted
+connection.
 
 =head1 ARCHITECTURE
 
-Linux::Event continues to own epoll dispatch, socket lifecycle, TLS, framing,
-buffering, backpressure, fairness, deadlines, and the versioned native consumer
-ABI. Linux::Event::Async owns coroutine-facing suspension state,
-Future::AsyncAwait integration, cancellation semantics, async-sub result
-Futures, and operation adapters over Linux::Event resources.
+Linux::Event continues to own epoll dispatch, socket lifecycle, bind/listen and
+accept4, TLS, framing, buffering, backpressure, fairness, deadlines, and the
+versioned native consumer ABI. Linux::Event::Async owns coroutine-facing
+suspension state, Future::AsyncAwait integration, cancellation semantics,
+async-sub result Futures, and operation adapters over Linux::Event resources.
 
 The dependency direction is intentionally one way:
 
@@ -89,10 +94,10 @@ framers with L<Linux::Event::Framer>. That subclass retains the normal
 Linux::Event stream policy surface, including C<stream_options>, socket policy,
 and declarative L<Linux::Event::TLS> configuration.
 
-For an outbound connection, C<< await $stream->ready >> waits until the Stream
-is application-ready. For TLS that means after handshake and verification, not
-merely after TCP connection. The normal C<on_ready> lifecycle callback remains
-available and runs before readiness Future waiters resume.
+For an outbound or accepted connection, C<< await $stream->ready >> waits until
+the Stream is application-ready. For TLS that means after handshake and
+verification, not merely after TCP connection. The normal C<on_ready> lifecycle
+callback remains available and runs before readiness Future waiters resume.
 
 Only one receive may be pending on a Stream. Clean EOF resolves to C<undef>.
 Cancelling a pending receive does not close the Stream and does not consume the
@@ -101,6 +106,21 @@ errors supplied by Linux::Event.
 
 See L<Linux::Event::Async::Stream> for the complete readiness, receive,
 cancellation, framing, TLS, and tuning contract.
+
+=head1 LISTENER MODEL
+
+L<Linux::Event::Async::Listener> provides C<< await $listener->accept >> and
+returns the exact C<stream_class> object constructed by the Linux::Event core.
+One persistent Listener Awaitable is reused across an accept loop.
+
+The Async Listener is pull-based: acceptance is paused while no accept is
+pending, and cancellation pauses rather than closes the listening socket. For
+the first stable implementation it uses one level-triggered kernel accept per
+armed wait so additional connections remain in the kernel backlog rather than
+being accepted and discarded behind a completed Awaitable.
+
+Use an L<Linux::Event::Async::Stream> subclass as C<stream_class> for a complete
+coroutine path from accept through application readiness and framed receive.
 
 =head1 DRIVING ASYNC WORK
 
@@ -121,15 +141,15 @@ newer, and Future::AsyncAwait 0.71 or newer.
 =head1 FIRST RELEASE SCOPE
 
 Version 0.002 provides the async-sub Future implementation, awaitable Stream
-application readiness, and framed C<SOCK_STREAM> receive. Additional awaitable
-operations such as listener accept, output drain, timers, datagrams, process
-completion, signals, eventfd events, pipe/TTY operations, resolver operations,
-and generic fd readiness are future extensions and are not part of the 0.002
-API contract.
+application readiness, persistent Listener C<accept>, and framed C<SOCK_STREAM>
+receive. Additional awaitable operations such as output drain, timers,
+datagrams, process completion, signals, eventfd events, pipe/TTY operations,
+resolver operations, and generic fd readiness are future extensions and are not
+part of the 0.002 API contract.
 
 =head1 SEE ALSO
 
-L<Linux::Event::Async::Stream>, L<Linux::Event::Async::Future>,
-L<Linux::Event>, L<Future::AsyncAwait>
+L<Linux::Event::Async::Listener>, L<Linux::Event::Async::Stream>,
+L<Linux::Event::Async::Future>, L<Linux::Event>, L<Future::AsyncAwait>
 
 =cut
