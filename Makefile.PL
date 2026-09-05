@@ -15,6 +15,7 @@ my @public_modules = qw(
     Linux::Event::Async::Listener
     Linux::Event::Async::Timer
     Linux::Event::Async::Dgram
+    Linux::Event::Async::Process
 );
 
 my $distribution_version = MM->parse_version('lib/Linux/Event/Async.pm');
