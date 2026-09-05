@@ -1,174 +1,50 @@
-# Linux::Event::Async Roadmap
+# Linux::Event::Async Status and Roadmap
 
-## Purpose
+## Current status
 
-`Linux::Event::Async` will provide Future::AsyncAwait-compatible async/await
-support above the callback-first Linux::Event reactor.
+Linux::Event::Async 0.001 is the first stable release target.
 
-The project must preserve the architectural boundary established by benchmark
-evidence:
+The architectural prerequisite that originally blocked this distribution is no
+longer pending. Linux::Event 0.110 ships the public versioned ordered-byte
+consumer ABI and the public `Linux::Event::IO::Sock::Stream` hierarchy used by
+Linux::Event::Async.
 
-```text
-Linux::Event
-    callback/reactor core
-    Stream lifecycle and transports
-    native framing
-    generic native message-consumer capability
-
-Linux::Event::Async
-    reusable receive Awaitable
-    Future::AsyncAwait integration
-    async-sub result Future
-    higher-level async operations
-```
-
-Linux::Event remains independently useful and must not depend on Future,
-Future::AsyncAwait, or Linux::Event::Async.
-
-## Confirmed decisions
-
-1. Linux::Event remains callback/reactor-first.
-2. Async/await is a separate distribution layered above Linux::Event.
-3. A received message must not require allocating and completing a new Future.
-4. A Stream uses one reusable receive Awaitable state.
-5. One conventional Future is still required for the result of an entire
-   `async sub`.
-6. Native framing should be able to complete the receive Awaitable without
-   first invoking a public Perl `on_message` callback.
-7. Callback delivery and pull/Awaitable delivery are mutually exclusive for
-   one Stream descriptor.
-8. Cancellation of a pending receive does not close the Stream or consume the
-   next message.
-9. Only one receive may be active on a Stream.
-10. The core extension boundary must be generic and versioned; it must not
-    expose Future::AsyncAwait-specific semantics.
-11. Native framing is optional. The async design must remain functional for
-    raw Streams and Perl framing, although the fastest path uses native framing.
-12. Performance claims must identify framing mode, read policy, watcher
-    dispatch, producer design, and Awaitable implementation.
-
-## Benchmark evidence
-
-These benchmarks used AF_UNIX socketpairs, epoll, a forked producer released by
-a timing barrier, stock Future::AsyncAwait 0.71, position-rotated samples, and
-matched read sizes.
-
-### Stable terminology
-
-- **Stream Awaitable**: a reusable Awaitable completed through a normal public
-  Stream callback.
-- **Direct Awaitable**: a reusable Awaitable completed without passing through
-  that public callback.
-
-With Perl framing, Direct Awaitable used a bare `watch_fd` receiver. With
-native framing, the native framer belongs to Stream, so Direct Awaitable used
-Stream's embedded native receive state. This implementation difference must be
-stated whenever the tables are cited.
-
-### Perl delimiter framing
-
-The comparison used Perl `index`/`substr` framing and the same bounded
-one-read policy for both implementations.
-
-| Payload | Stream Awaitable | Direct Awaitable | Stream retained |
-|---:|---:|---:|---:|
-| 2,500 B | 170,711 msg/s | 202,432 msg/s | 84.3% |
-| 35,000 B | 57,213 msg/s | 68,231 msg/s | 83.9% |
-| 200,000 B | 15,060 msg/s | 17,832 msg/s | 84.5% |
-
-This established that the Stream abstraction itself imposed approximately 16%
-overhead in the matched test. Earlier approximately 2:1 results had mixed
-main's drain-until-EAGAIN policy with the direct receiver's bounded one-read
-policy and must not be cited as intrinsic Stream overhead.
-
-### Native delimiter framing
-
-The comparison used main-style Perl watcher dispatch and a read budget equal to
-one read. The native callback result is included as the delivery ceiling.
-
-| Payload | Native callback | Stream Awaitable | Direct Awaitable | Stream retained |
-|---:|---:|---:|---:|---:|
-| 2,500 B | 924,262 msg/s | 170,677 msg/s | 533,964 msg/s | 32.0% |
-| 35,000 B | 119,449 msg/s | 86,258 msg/s | 120,209 msg/s | 71.8% |
-| 200,000 B | 20,948 msg/s | 22,780 msg/s | 24,061 msg/s | 94.7% |
-
-Native framing changed the tradeoff. The public Perl `on_message` entry before
-coroutine resumption dominated small-message Stream Awaitable performance.
-Direct native completion was more than three times faster at 2.5 KB, 39% faster
-at 35 KB, and approximately 6% faster at 200 KB.
-
-The target architecture is therefore a Direct Awaitable built through a generic
-native consumer capability, not a Future-first reactor.
-
-### Async Stream performance recapture
-
-The first implementation benchmark isolated the remaining small-message loss
-to the Future::AsyncAwait boundary rather than the consumer ABI. At 2,500-byte
-payloads, the native consumer driven manually through its XSUBs exceeded one
-million messages per second while the initial async loop reached 342,589
-messages per second.
-
-The optimization sequence retained one native Awaitable view per Stream and
-then moved public `recv` into XS. Separate position-rotated runs measured:
-
-| 2,500-byte receive path | Median msg/s | Historical Direct retained |
-|---|---:|---:|
-| Initial reusable Stream Awaitable | 342,589 | 64.2% |
-| Persistent native Awaitable view | 362,164 | 67.8% |
-| Native view plus XS `recv` | 416,817-456,923 | 78.1-85.6% |
-
-The runs showed substantial host scheduling variance, so these figures are
-stage evidence rather than release claims. The matched three-payload benchmark
-remains the acceptance tool. Repeated cancellation chaining to the persistent
-view uses one native target slot and deduplicates the common case. This bounds
-retained cancellation state across long receive loops without weakening
-cancellation of the currently armed receive; distinct explicit targets remain
-supported through an overflow array.
-
-## Distribution responsibilities
-
-### Linux::Event
-
-Linux::Event owns:
-
-- epoll dispatch;
-- watcher and Stream lifecycle;
-- transports and TLS;
-- native and raw input buffering;
-- native framing;
-- backpressure;
-- read fairness;
-- a generic native message-consumer extension ABI;
-- ownership-safe delivery of message, EOF, and failure events;
-- introspection counters for the generic consumer path.
-
-Linux::Event does not own:
+The implemented 0.001 surface is intentionally narrow:
 
 - Future::AsyncAwait integration;
-- `AWAIT_*` methods;
-- async/await syntax;
-- general Future state;
-- coroutine-result objects;
-- Future chaining or Future cancellation policy;
-- public methods named `recv_native` or `recv_embedded`.
+- `Linux::Event::Async::Future` for `async sub` results;
+- `Linux::Event::Async::Stream` for framed `SOCK_STREAM` receive;
+- one persistent native receive Awaitable per Stream;
+- receive cancellation, EOF, failure, and reentrant close handling; and
+- bounded native prefetch for consecutive receives.
 
-### Linux::Event::Async
+The old implementation staging plan is complete. This document now records the
+constraints that must remain true and the direction for work after 0.001.
+
+## Architectural boundary
+
+Linux::Event remains a callback-first reactor. It owns:
+
+- epoll dispatch;
+- ordered-byte I/O;
+- socket acquisition and lifecycle;
+- native framers;
+- TLS;
+- buffering and output queues;
+- backpressure and fairness;
+- deadlines and timeouts; and
+- the versioned native consumer extension ABI.
 
 Linux::Event::Async owns:
 
-- `Linux::Event::Async`;
-- `Linux::Event::Async::Stream`;
-- `Linux::Event::Async::Future`;
-- the native consumer implementation;
-- reusable receive state;
-- Future::AsyncAwait's Awaitable protocol;
-- receive cancellation semantics;
-- top-level `AWAIT_WAIT`;
-- async operations added after Stream receive is complete;
-- Awaitable conformance tests;
-- async-specific benchmarks and documentation.
+- Future::AsyncAwait integration;
+- coroutine-facing receive state;
+- the persistent Stream receive Awaitable;
+- async-sub result Futures;
+- cancellation propagation between those Futures and awaited operations; and
+- future async operation adapters built on Linux::Event primitives.
 
-The distribution dependency is one-way:
+The dependency direction stays one way:
 
 ```text
 Linux::Event::Async -> Linux::Event
@@ -178,112 +54,26 @@ Linux::Event -X-> Linux::Event::Async
 Linux::Event -X-> Future::AsyncAwait
 ```
 
-## Proposed Linux::Event native consumer ABI
+Linux::Event core must never need Future knowledge to support this distribution.
 
-The initial design should use a versioned function table rather than linking an
-external distribution directly against private XS symbols.
+## Public extension boundary
 
-A conceptual provider interface is:
+Linux::Event::Async must consume only supported Linux::Event public surfaces:
 
-```c
-typedef struct les_consumer_api_v1 {
-    void *(*create)(pTHX_ SV *stream);
-    int   (*message)(pTHX_ void *context, SV *message);
-    void  (*eof)(pTHX_ void *context);
-    void  (*fail)(pTHX_ void *context, SV *error);
-    void  (*destroy)(pTHX_ void *context);
-} les_consumer_api_v1;
-```
+- `Linux::Event::IO::Sock::Stream` as the public stream-socket base;
+- `Linux::Event::Framer` for native framing and consumer declaration; and
+- ordered-byte consumer ABI v1 for native message delivery.
 
-The exact ABI is not yet frozen. Before implementation it must define:
+The Async distribution vendors the ABI v1 header used to compile its provider.
+That header must stay synchronized with the ABI contract shipped by the minimum
+supported Linux::Event release.
 
-- structure size and ABI version;
-- interpreter/thread ownership;
-- message SV ownership transfer;
-- context lifetime;
-- Stream lifetime while a continuation is active;
-- reentrancy during `message`;
-- EOF and failure ordering;
-- cancellation and detachment;
-- return codes such as continue, pause, close, and error;
-- safe behavior after ithread cloning;
-- behavior when an extension was built against an incompatible core.
+Async must not link directly against private Linux::Event XS symbols or treat
+historical private implementation package names as application APIs.
 
-Stream state should need only the provider table and one provider-owned context:
+## Stream receive model
 
-```c
-const les_consumer_api_v1 *consumer_api;
-void *consumer_context;
-```
-
-Linux::Event::Async should own the Awaitable fields in that context rather than
-placing Future-like state in Linux::Event core.
-
-## Descriptor and delivery model
-
-The native consumer should participate in the cached Stream descriptor system,
-similar to native framer and TLS declarations.
-
-A descriptor selects exactly one framed delivery mode:
-
-```text
-on_message
-on_messages
-native consumer
-```
-
-A native consumer must not be combined with `on_message` or `on_messages`.
-
-The desired receive sequence is:
-
-```text
-recv arms reusable consumer context
-    -> native parser produces one message
-    -> native consumer marks the receive ready
-    -> consumer invokes the FAA continuation
-    -> AWAIT_GET takes the result and resets the context
-    -> the coroutine may immediately arm the next receive
-```
-
-The implementation must detach or otherwise stabilize the old receive state
-before invoking the continuation. The resumed coroutine may issue another
-receive before the original native delivery call returns.
-
-## Buffering and backpressure
-
-The common pending-receive path should transfer the completed message directly
-into the consumer context without copying payload bytes.
-
-When no receive is armed, the preferred design is to retain input in Stream's
-native buffer and stop parsing rather than eagerly creating an unbounded Perl
-message queue. Read interest may be paused to allow kernel backpressure.
-
-When a receive is armed again:
-
-1. resume parsing existing native input;
-2. complete one receive;
-3. stop again unless reentrant coroutine execution armed another receive.
-
-A bounded ready-message slot may be used if required, but unlimited pre-decoded
-message queuing is not the default design.
-
-## Read fairness and watcher dispatch
-
-The core work should include or preserve a configurable
-`read_budget_bytes`. Benchmark comparisons demonstrated that
-read-drain policy materially changes results. Zero may retain unlimited-drain
-semantics; production defaults require a separate evidence-based decision.
-
-Direct native Stream watcher dispatch is independent of async/await and may be
-included if regression testing confirms it benefits Stream without weakening
-the public watcher contract.
-
-Neither read fairness nor native watcher dispatch should be presented as an
-async-only optimization.
-
-## Linux::Event::Async API direction
-
-Application subclasses should inherit explicitly:
+A concrete Async Stream is a protocol subclass:
 
 ```perl
 package MyProtocol;
@@ -291,184 +81,182 @@ use parent 'Linux::Event::Async::Stream';
 use Linux::Event::Framer 'Delimiter', "\n";
 ```
 
-Application code should use:
+The subclass is where Linux::Event resolves and caches protocol policy:
 
-```perl
-my $message = await $stream->recv;
-```
+- native framing;
+- TLS policy;
+- socket policy;
+- `stream_options`; and
+- lifecycle behavior.
 
-`recv` arms one reusable receive in XS and returns a stable native Awaitable
-view whose scalar contains the receive-context pointer directly. Each Stream
-creates that view once. A separately allocated operation per message is not
-acceptable for the primary fast path.
+The Async consumer replaces framed callback delivery. `on_message`,
+`on_messages`, and `message_batch_size` cannot be combined with the native
+Async consumer.
 
-Required Awaitable behavior includes:
+### Receive state
 
-- `AWAIT_IS_READY`;
-- `AWAIT_IS_CANCELLED`;
-- `AWAIT_ON_READY`;
-- `AWAIT_GET`;
-- `AWAIT_CLONE`;
-- `AWAIT_CHAIN_CANCEL`;
-- `AWAIT_ON_CANCEL`;
-- `AWAIT_WAIT`.
+Each Stream owns one provider context and one persistent Awaitable view.
 
-`AWAIT_CLONE` returns `Linux::Event::Async::Future`, not another Stream.
-That Future represents the whole async sub.
-
-Future::AsyncAwait receive generations are serialized: a second receive cannot
-overlap a pending generation or start before the ready result is consumed, and
-the ready callback is detached before coroutine resumption. This prevents an
-old await continuation from firing for a later receive while allowing the
-native view itself to remain persistent.
-
-## Receive semantics
-
-The initial contract is:
-
-- one pending receive per Stream;
-- ordered message delivery;
-- clean EOF resolves as `undef`;
-- I/O, framing, timeout, explicit-close, and transport failures throw typed
-  Linux::Event errors;
-- cancellation releases only the pending receive;
-- cancellation does not close the Stream;
-- cancellation does not consume the next message;
-- bytes arriving after cancellation remain available;
-- callback and Awaitable delivery cannot be mixed;
-- reentrant next-receive registration is supported;
-- Stream close, detach, transition, TLS shutdown, and destruction cannot leave
-  a continuation or consumer context dangling.
-
-## Main-distribution implementation phase
-
-The next work begins in the Linux::Event repository, not this distribution.
-
-### Phase 1: design and branch preparation
-
-1. Start from the current Linux::Event `main` branch.
-2. Create a dedicated feature branch for the native consumer ABI.
-3. Preserve unrelated experimental Future-first work outside this branch.
-4. Record a pre-change callback and native-framing performance baseline.
-5. Freeze the v1 ownership and lifetime rules before exposing the ABI.
-
-### Phase 2: generic core capability
-
-1. Add versioned consumer declarations to Stream descriptors.
-2. Add provider table and context pointers to native Stream state.
-3. Route framed messages to either callbacks or the native consumer.
-4. Implement consumer-controlled pause/continue behavior.
-5. Propagate EOF, framing failure, I/O failure, timeout, close, detach, and
-   destruction.
-6. Add safe reentrancy around consumer invocation.
-7. Add or preserve bounded read fairness.
-8. Evaluate direct native Stream watcher dispatch independently.
-9. Add introspection counters for consumer calls, pauses, buffered input,
-   ownership transfers, and failures.
-
-### Phase 3: core-only test provider
-
-Linux::Event tests must include a small fake native consumer that has no
-Future::AsyncAwait dependency. It should prove:
-
-- descriptor registration;
-- message ordering;
-- direct ownership transfer;
-- immediate and delayed consumption;
-- pause and resume;
-- clean EOF;
-- typed failures;
-- cancellation/detachment equivalent cleanup;
-- Stream destruction;
-- reentrant consumer behavior;
-- callback/consumer exclusivity;
-- incompatible ABI rejection;
-- ithread clone safety or explicit clone rejection.
-
-### Phase 4: regression testing
-
-Before any main-branch merge:
-
-1. Run the complete Linux::Event test suite.
-2. Run callback delivery benchmarks before and after the change.
-3. Test raw `on_data`, `on_message`, and `on_messages`.
-4. Test every built-in/native-plugin framer.
-5. Test plain, TLS, accepted, connected, transitioned, paused, and closing
-   Streams.
-6. Test read budgets of one read, bounded multi-read, and unlimited drain.
-7. Confirm no callback-mode allocation or dispatch regression when no consumer
-   is configured.
-8. Inspect callback entries, epoll events, reads, bytes copied, queue depth,
-   native buffer depth, and consumer invocations.
-9. Run sanitizers or equivalent native lifetime diagnostics where practical.
-10. Run `git diff --check` and a clean distribution build.
-
-The benchmark acceptance matrix retains the established payloads:
+The normal sequence is:
 
 ```text
-2,500 bytes
-35,000 bytes
-200,000 bytes
+recv arms reusable receive context
+    -> Linux::Event reads and frames input
+    -> native consumer receives a complete message
+    -> receive state becomes ready
+    -> Future::AsyncAwait continuation resumes
+    -> AWAIT_GET consumes the result
+    -> coroutine may immediately arm the next receive
 ```
 
-Report median message rate, payload throughput, CPU time per message, p50/p99
-latency, read syscalls, epoll events, Perl callback entries, continuation
-invocations, allocations, and copied bytes where instrumentable.
+A second receive cannot overlap a pending generation, and a ready generation
+must be consumed before the next generation begins.
 
-### Phase 5: merge and release gate
+### Bounded prefetch
 
-The Linux::Event core change is ready only when:
+During one native framed-input drain, Async may retain up to 64 additional
+messages and approximately 256 KiB of payload. The byte threshold permits one
+complete-frame overshoot.
 
-- ordinary callback semantics are unchanged;
-- callback throughput has no material regression;
-- the fake consumer passes lifecycle and ownership tests;
-- the ABI is documented and versioned;
-- unsupported ABI versions fail clearly;
-- the full test suite passes;
-- the native consumer benchmark demonstrates that the extension boundary
-  preserves the Direct Awaitable performance opportunity.
+The prefetch exists to allow consecutive receives to complete without one
+coroutine suspension per already-buffered frame. It is deliberately bounded.
+When the bound is reached, consumer delivery pauses and normal Linux::Event
+backpressure resumes.
 
-Only after that core capability is merged and released should
-Linux::Event::Async implementation begin.
+An unbounded decoded-message queue is not part of the design.
 
-## Linux::Event::Async implementation phase
+### Terminal and cancellation semantics
 
-After the required Linux::Event release:
+The stable receive contract is:
 
-1. Create the distribution skeleton.
-2. Declare the minimum compatible Linux::Event ABI/version.
-3. Implement the provider-owned reusable receive context.
-4. Implement `Linux::Event::Async::Stream`.
-5. Implement `Linux::Event::Async::Future`.
-6. Integrate Future::AsyncAwait without patching FAA.
-7. Run the official alternative-Awaitable conformance suite.
-8. Add pending, immediate-ready, cancellation, EOF, failure, close, detach,
-   reentrancy, destruction, and repeated-use tests.
-9. Reproduce both Perl-framing and native-framing benchmark matrices.
-10. Document callback versus async tradeoffs honestly.
-11. Add timers, process completion, connect, accept, drain, resolver, or other
-    async operations only after Stream receive is stable.
+- one pending receive per Stream;
+- ordered framed delivery;
+- clean EOF resolves as `undef`;
+- I/O, framing, close, detach, and read-side lifecycle failures throw typed
+  Linux::Event errors;
+- receive cancellation does not close the Stream;
+- receive cancellation does not consume the next message;
+- async-sub Future cancellation propagates to the receive currently awaited;
+- terminal events remain ordered after already prefetched messages; and
+- Stream close or destruction cannot leave a dangling provider or continuation.
 
-## Non-goals for the first release
+## Native lifetime rule
 
-The first release does not attempt:
+Provider-owned frames that call back into Linux::Event through the consumer host
+API must obey ABI v1 retain/release ownership.
 
-- multiple concurrent readers on one Stream;
-- a general scheduler replacement;
-- structured concurrency;
-- an FAA-private continuation ABI;
-- universal awaitability of ordinary Linux::Event objects;
-- making Linux::Event depend on Future;
-- batching every operation behind one abstraction;
-- eliminating the documented FAA CODE-reference continuation boundary.
+Before a callback-capable host call such as resume or pause, Async retains the
+host. The matching release is the provider frame's final host/context action.
+The release may destroy both the host state and the provider context.
 
-## Immediate next work
+This rule is required because resume, pause, cancellation callbacks, or resumed
+coroutines can reentrantly close or destroy the Stream.
 
-The next work session is specifically:
+Tests must continue to cover reentrant close from provider-controlled callback
+paths rather than relying only on stress or global-destruction tests.
 
-> Implement the generic native consumer capability in the Linux::Event main
-> codebase on an appropriate feature branch, then perform comprehensive
-> callback and Stream regression testing.
+## Future model
 
-Do not begin the Linux::Event::Async implementation until that main-distribution
-work has passed its regression and benchmark gates.
+`Linux::Event::Async::Future` represents an entire asynchronous computation,
+not one Stream message.
+
+It implements the Future::AsyncAwait Awaitable protocol and native result,
+failure, readiness, cancellation, and cancellation-chain state. It is not a
+subclass of the CPAN `Future` distribution and is not intended to reproduce that
+module's complete API.
+
+`AWAIT_WAIT` follows the Linux::Event Loop associated with the operation the
+async sub is currently awaiting. Loop association is resolved again between
+dispatches so sequential awaits may move between Loops.
+
+## Performance invariants
+
+The first release established several design constraints that should not be
+casually traded away:
+
+1. No per-message Future allocation on Stream receive.
+2. No per-message Awaitable allocation on Stream receive.
+3. Native framing remains in Linux::Event.
+4. Linux::Event callback users pay no Future::AsyncAwait dependency or dispatch
+   tax for Async support.
+5. Async buffering remains bounded.
+6. Framing, TLS, and Stream tuning stay class policy rather than being rebuilt
+   around each receive operation.
+7. Any optimization must preserve lifecycle correctness under reentrant close,
+   cancellation, EOF, detach, and destruction.
+
+Benchmark results are evidence for these choices, not API guarantees. Changes to
+the receive path should be evaluated with the repository benchmark harnesses on
+multiple payload sizes and should always be paired with correctness tests.
+
+## 0.001 release gates
+
+A 0.001 release candidate should satisfy all of the following:
+
+- Linux::Event minimum dependency is a released version containing consumer ABI
+  v1; currently 0.110;
+- the vendored ABI header matches the supported core ABI;
+- the distribution builds and tests on Perl 5.36 and the current supported Perl;
+- the Future::AsyncAwait alternative-Awaitable conformance tests pass;
+- Stream receive, cancellation, EOF, prefetch, reentrancy, global destruction,
+  and stress tests pass;
+- reentrant Stream close is covered under the host retain/release rule;
+- `make disttest` passes in a clean distribution tree;
+- current Linux::Event main remains integration-compatible;
+- CPAN metadata declares every runtime and test dependency;
+- public modules carry one stable distribution version; and
+- POD, README, Changes, LICENSE, and metadata describe the released architecture
+  rather than an unreleased development branch.
+
+## Work after 0.001
+
+The next useful layer is not a new event loop abstraction. It is a small set of
+awaitable operations over capabilities Linux::Event already owns.
+
+Candidate priorities are:
+
+1. connection readiness and connection failure;
+2. listener accept;
+3. output drain and write-side completion;
+4. timers;
+5. process completion;
+6. resolver completion; and
+7. other kernel-event operations where an Awaitable materially improves
+   application structure.
+
+Each operation should answer the same questions before becoming public:
+
+- Can it reuse stable native or object-owned state rather than allocate an
+  avoidable wrapper on every operation?
+- What owns cancellation?
+- Which Loop drives `AWAIT_WAIT`?
+- What happens under close or destruction while a continuation is running?
+- Does exposing it in Async require any change to callback users in core?
+- Can the feature be implemented through a public Linux::Event boundary?
+
+## Deferred higher-level work
+
+Structured concurrency, task groups, cancellation scopes, protocol-specific
+clients, HTTP, WebSocket, and application frameworks belong above the 0.001
+primitive layer.
+
+They may eventually use Linux::Event::Async, but they should not force Future or
+protocol semantics back into Linux::Event core.
+
+## Non-goals
+
+The project does not currently aim to:
+
+- replace Linux::Event's reactor with a scheduler;
+- make Linux::Event depend on Future::AsyncAwait;
+- make every Linux::Event object automatically Awaitable;
+- support multiple simultaneous readers on one Stream;
+- expose private Future::AsyncAwait continuation internals;
+- provide an unbounded message queue;
+- hide Stream framing, TLS, or tuning policy inside generic operation objects;
+  or
+- claim that async/await is inherently faster than callbacks.
+
+The purpose is to provide ergonomic coroutine syntax while preserving the
+performance and policy advantages of Linux::Event's native callback and Stream
+architecture.
