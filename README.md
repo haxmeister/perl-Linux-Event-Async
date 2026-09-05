@@ -9,13 +9,15 @@ Version 0.002 is the first stable release. It provides:
 - `Linux::Event::Async::Future` for `async sub` results and cold one-shot waits;
 - `Linux::Event::Async::Stream` with `ready`, `drain`, and persistent framed
   `recv`;
-- `Linux::Event::Async::Listener` with persistent pull-based `accept`; and
+- `Linux::Event::Async::Listener` with persistent pull-based `accept`;
+- `Linux::Event::Async::Dgram` with `ready`, `drain`, and persistent pull-based
+  packet `recv`; and
 - `Linux::Event::Async::Timer` with persistent `wait` and coalesced expiration
   counts.
 
 The design keeps Linux::Event callback-first underneath. Async is a language
-surface over the existing epoll, socket, TLS, framing, backpressure, and timer
-machinery rather than a second event loop.
+surface over the existing epoll, socket, TLS, framing, datagram, backpressure,
+and timer machinery rather than a second event loop.
 
 ## Requirements
 
@@ -28,7 +30,7 @@ Linux::Event 0.110 is the minimum because it contains the public resource
 hierarchy and the ordered-byte consumer ABI used by the optimized Stream receive
 path.
 
-## Complete socket example
+## Complete stream-socket example
 
 Define the protocol once as a Stream subclass:
 
@@ -237,6 +239,88 @@ measurement justifies it.
 `on_accept` and `on_error` are reserved by `Linux::Event::Async::Listener` as
 its Awaitable bridge.
 
+## Awaitable Datagram I/O
+
+Define Datagram socket policy once on a subclass:
+
+```perl
+package PacketSocket;
+use parent 'Linux::Event::Async::Dgram';
+
+sub datagram_options ($class) {
+    return (
+        max_datagram_size => 65_535,
+        receive_buffer    => 1_048_576,
+    );
+}
+```
+
+Then receive one kernel packet at a time:
+
+```perl
+my $socket = PacketSocket->new(
+    loop => $loop,
+    host => '127.0.0.1',
+    port => 9999,
+);
+
+await $socket->ready;
+
+while (1) {
+    my ($payload, $peer) = await $socket->recv;
+    my $ok = $socket->send($payload, to => $peer);
+    await $socket->drain if defined($ok) && !$ok;
+}
+```
+
+`recv` uses one persistent Awaitable per Datagram socket. In list context it
+returns payload and `Linux::Event::Address`; in scalar context it returns the
+payload.
+
+Async Datagram receive is pull-based. Linux::Event normally permits batched
+`recvmsg` work, but a pull Awaitable cannot safely consume only the first packet
+after a tail batch has already been removed from the kernel. Version 0.002
+therefore fixes `max_datagrams_per_tick => 1` and `edge_triggered => 0` for Async
+Dgram. When no receive is pending, read interest is paused and additional
+packets stay in the kernel receive queue.
+
+Cancelling a receive pauses only the wait. It does not close the Datagram socket
+or consume the next packet. Oversized packets and receive failures propagate the
+same typed errors reported by core.
+
+The complete effective Async `datagram_options` surface is:
+
+```perl
+sub datagram_options ($class) {
+    return (
+        max_datagram_size      =>     65_535,
+        max_datagrams_per_tick =>          1,
+        edge_triggered         =>          0,
+        high_watermark         =>  1_048_576,
+        low_watermark          =>    262_144,
+        max_pending_bytes      =>          0,
+        max_pending_datagrams  =>          0,
+        reuseaddr              =>          0,
+        reuseport              =>          0,
+        broadcast              =>          0,
+        v6only                 =>      undef,
+        send_buffer            =>      undef,
+        receive_buffer         =>      undef,
+    );
+}
+```
+
+The one-packet and level-triggered values are required by the Async pull model;
+the remaining options preserve Linux::Event semantics. Atomic packet boundaries,
+connected/unconnected UDP, Unix-domain datagrams, adopted sockets, peer
+addresses, socket policy, queue limits, and output backpressure remain core
+behavior.
+
+`ready` and `drain` are cold Future waits. `drain` resolves when an output
+high-water blocked period crosses the configured low watermark, not necessarily
+when the packet queue becomes empty. `on_datagram` and `on_drain` are reserved
+by `Linux::Event::Async::Dgram` as its Awaitable bridges.
+
 ## Awaitable Timer
 
 ```perl
@@ -277,8 +361,8 @@ bridge.
 ## Future model
 
 `Linux::Event::Async::Future` represents an asynchronous computation or a cold
-one-shot wait such as Stream readiness or drain. It is intentionally separate
-from persistent hot-operation Awaitables.
+one-shot wait such as Stream/Dgram readiness or drain. It is intentionally
+separate from persistent hot-operation Awaitables.
 
 `AWAIT_WAIT` drives one `run_once(-1)` at a time on the Linux::Event Loop
 associated with the operation currently awaited by the Future. Sequential
@@ -296,11 +380,12 @@ The operation type determines the suspension mechanism:
 ```text
 cold transition
     Stream ready / Stream drain
+    Dgram ready / Dgram drain
         -> Linux::Event::Async::Future
         -> Future::AsyncAwait continuation
 
 hot repeated operation
-    Stream recv / Listener accept / Timer wait
+    Stream recv / Listener accept / Dgram recv / Timer wait
         -> persistent per-resource Awaitable
         -> Future::AsyncAwait continuation
 ```
@@ -315,10 +400,10 @@ for this distribution.
 ## 0.002 scope
 
 The first stable release includes Future::AsyncAwait integration, Stream
-readiness/drain/framed receive, pull-based Listener accept, and awaitable Timer
-expiration. Datagram operations, process completion, signals, eventfd events,
-Pipe/TTY operations, resolver operations, and generic fd readiness remain future
-work.
+readiness/drain/framed receive, pull-based Listener accept, pull-based Datagram
+receive/output backpressure, and awaitable Timer expiration. Process completion,
+signals, eventfd events, Pipe/TTY operations, resolver operations, and generic fd
+readiness remain future work.
 
 See `ASYNC-ROADMAP.md` for the architecture constraints and extension priorities.
 
