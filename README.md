@@ -11,13 +11,15 @@ Version 0.002 is the first stable release. It provides:
   `recv`;
 - `Linux::Event::Async::Listener` with persistent pull-based `accept`;
 - `Linux::Event::Async::Dgram` with `ready`, `drain`, and persistent pull-based
-  packet `recv`; and
+  packet `recv`;
 - `Linux::Event::Async::Timer` with persistent `wait` and coalesced expiration
-  counts.
+  counts; and
+- `Linux::Event::Async::Process` with Future-based process completion `wait`
+  after pidfd reaping and final stdout/stderr drain.
 
 The design keeps Linux::Event callback-first underneath. Async is a language
 surface over the existing epoll, socket, TLS, framing, datagram, backpressure,
-and timer machinery rather than a second event loop.
+timer, and pidfd process machinery rather than a second event loop.
 
 ## Requirements
 
@@ -358,11 +360,70 @@ Timer remains active. Core `$timer->cancel` remains terminal and fails a pending
 wait. `on_timer` is reserved by `Linux::Event::Async::Timer` as its Awaitable
 bridge.
 
+## Awaitable Process completion
+
+Process completion is a cold one-shot transition, so it uses a normal Async
+Future rather than a persistent Awaitable:
+
+```perl
+package WorkerProcess;
+use parent 'Linux::Event::Async::Process';
+
+sub on_stdout ($process, $bytes) {
+    print $bytes;
+}
+
+package main;
+my $process = WorkerProcess->spawn(
+    loop    => $loop,
+    command => [$^X, '-e', 'print "done\\n"'],
+    stdout  => 'pipe',
+);
+
+await $process->wait;
+say $process->exit_code;
+```
+
+`Linux::Event::Async::Process` retains the public
+`Linux::Event::Kernel::Process` pidfd lifecycle. Core reaps the child and drains
+remaining stdout/stderr bytes before its reserved `on_exit` bridge completes
+pending wait Futures. Exit status and final output callbacks are therefore
+stable when `await $process->wait` resumes.
+
+Multiple Futures may wait for the same exit. Cancelling one wait affects only
+that Future: it does not signal, kill, detach, or otherwise alter the Process.
+Process signaling remains explicit through the core `signal` method.
+
+The complete `process_options` tuning surface remains available:
+
+```perl
+sub process_options ($class) {
+    return (
+        read_size            =>    65_536,
+        max_reads_per_tick   =>         64,
+        stdin_high_watermark =>  1_048_576,
+        stdin_low_watermark  =>    262_144,
+        max_pending_stdin    =>          0,
+    );
+}
+```
+
+Version 0.002 intentionally leaves stdout/stderr on the core callback path and
+retains `write_stdin`, `close_stdin`, and `pending_stdin_bytes` as core
+operations. Linux::Event may drain multiple child-pipe reads in one readiness
+turn; a pull-style stdout/stderr API needs an explicit bounded buffering or
+one-read fairness contract before it belongs in Async.
+
+`on_exit` is reserved by `Linux::Event::Async::Process` for `wait`. Reusable
+stdout/stderr/EOF/error callbacks may still live on the subclass. Per-instance
+callback constructor options are not accepted so the Async Process contract is
+identical on the minimum supported Linux::Event 0.110 and current core.
+
 ## Future model
 
 `Linux::Event::Async::Future` represents an asynchronous computation or a cold
-one-shot wait such as Stream/Dgram readiness or drain. It is intentionally
-separate from persistent hot-operation Awaitables.
+one-shot wait such as Stream/Dgram readiness or drain and Process exit. It is
+intentionally separate from persistent hot-operation Awaitables.
 
 `AWAIT_WAIT` drives one `run_once(-1)` at a time on the Linux::Event Loop
 associated with the operation currently awaited by the Future. Sequential
@@ -381,6 +442,7 @@ The operation type determines the suspension mechanism:
 cold transition
     Stream ready / Stream drain
     Dgram ready / Dgram drain
+    Process wait
         -> Linux::Event::Async::Future
         -> Future::AsyncAwait continuation
 
@@ -401,9 +463,9 @@ for this distribution.
 
 The first stable release includes Future::AsyncAwait integration, Stream
 readiness/drain/framed receive, pull-based Listener accept, pull-based Datagram
-receive/output backpressure, and awaitable Timer expiration. Process completion,
-signals, eventfd events, Pipe/TTY operations, resolver operations, and generic fd
-readiness remain future work.
+receive/output backpressure, awaitable Timer expiration, and awaitable Process
+completion. Signals, eventfd events, pull-style Process pipe I/O, Pipe/TTY
+operations, resolver operations, and generic fd readiness remain future work.
 
 See `ASYNC-ROADMAP.md` for the architecture constraints and extension priorities.
 
