@@ -12,6 +12,8 @@ use Linux::Event::Async::Listener ();
 use Linux::Event::Async::Timer ();
 use Linux::Event::Async::Dgram ();
 use Linux::Event::Async::Process ();
+use Linux::Event::Async::Signal ();
+use Linux::Event::Async::Event ();
 
 sub import {
     @_ = ('Future::AsyncAwait', future_class => 'Linux::Event::Async::Future');
@@ -72,18 +74,19 @@ Version 0.002 deliberately uses two suspension models. Cold lifecycle or
 backpressure transitions such as Stream/Dgram C<ready>, Stream/Dgram C<drain>,
 and Process C<wait> return ordinary L<Linux::Event::Async::Future> objects. Hot
 repeated operations such as framed Stream C<recv>, Dgram C<recv>, Listener
-C<accept>, and Timer C<wait> use persistent per-resource Awaitables so
-steady-state loops avoid one Future or Awaitable allocation per event.
+C<accept>, Timer C<wait>, Signal C<wait>, and Event C<wait> use persistent
+per-resource Awaitables so steady-state loops avoid one Future or Awaitable
+allocation per event.
 
 =head1 ARCHITECTURE
 
 Linux::Event continues to own epoll dispatch, socket lifecycle, bind/listen and
 accept4, datagram packet I/O, TLS, framing, buffering, backpressure, fairness,
 monotonic timer scheduling, pidfd process lifecycle, asynchronous process pipes,
-and the versioned native consumer ABI. Linux::Event::Async owns
-coroutine-facing suspension state, Future::AsyncAwait integration, cancellation
-semantics, async-sub result Futures, and operation adapters over Linux::Event
-resources.
+signalfd delivery, eventfd signaling, and the versioned native consumer ABI.
+Linux::Event::Async owns coroutine-facing suspension state,
+Future::AsyncAwait integration, cancellation semantics, async-sub result
+Futures, and operation adapters over Linux::Event resources.
 
 The dependency direction is intentionally one way:
 
@@ -176,6 +179,38 @@ path and retains C<write_stdin>, C<close_stdin>, and stdin backpressure as core
 operations. It does not impose a partially specified pull-buffering model on
 Process pipe I/O merely to add an C<await> spelling.
 
+=head1 SIGNAL MODEL
+
+L<Linux::Event::Async::Signal> adapts the public shared-signalfd
+L<Linux::Event::Kernel::Signal> subscription. C<< await $signal->wait >> returns
+the delivered signal number, and in list context also returns the aggregated
+signalfd record count.
+
+A Signal subscription cannot pause only its own fan-out while remaining attached
+to the shared signalfd. Notifications arriving without an armed wait are
+therefore coalesced in bounded state: at most one pending entry per subscribed
+signal number, with counts accumulated into that entry. No unbounded event queue
+is created.
+
+C<cancel_wait> affects only the suspension. Core C<< $signal->cancel >> remains
+the terminal subscription operation and fails a pending wait.
+
+=head1 EVENT MODEL
+
+L<Linux::Event::Async::Event> adapts the public eventfd-backed
+L<Linux::Event::Kernel::Event> primitive. C<< await $event->wait >> returns the
+counter value drained for the notification and reuses one persistent Awaitable.
+
+If the Loop drains eventfd while no wait is armed, Async accumulates the count
+in one scalar for the next wait rather than allocating per-notification queue
+entries. The Event still carries notification only; application payloads belong
+in the queue, pipe, socket, shared structure, or other IPC channel published
+before C<signal>.
+
+C<cancel_wait> is wait-local. Core C<< $event->cancel >> remains terminal.
+Core thread and fork signaling rules remain unchanged; cloned worker handles may
+signal but do not own Async wait state.
+
 =head1 DRIVING ASYNC WORK
 
 Calling an C<async sub> starts it immediately and returns a
@@ -224,19 +259,29 @@ counts;
 =item *
 
 L<Linux::Event::Async::Process> Future-based process completion C<wait> after
-pidfd reaping and final stdout/stderr drain.
+pidfd reaping and final stdout/stderr drain;
+
+=item *
+
+L<Linux::Event::Async::Signal> persistent C<wait> over shared signalfd delivery
+with bounded idle coalescing; and
+
+=item *
+
+L<Linux::Event::Async::Event> persistent C<wait> over eventfd counter delivery.
 
 =back
 
-Signals, eventfd events, pull-style process pipe operations, Pipe/TTY operations,
-resolver operations, and generic fd readiness remain future extensions rather
-than hidden 0.002 APIs.
+Pull-style process pipe operations, Pipe/TTY operations, standalone resolver
+operations, and generic fd readiness remain future extensions rather than hidden
+0.002 APIs.
 
 =head1 SEE ALSO
 
 L<Linux::Event::Async::Listener>, L<Linux::Event::Async::Stream>,
 L<Linux::Event::Async::Dgram>, L<Linux::Event::Async::Timer>,
-L<Linux::Event::Async::Process>, L<Linux::Event::Async::Future>,
+L<Linux::Event::Async::Process>, L<Linux::Event::Async::Signal>,
+L<Linux::Event::Async::Event>, L<Linux::Event::Async::Future>,
 L<Linux::Event>, L<Future::AsyncAwait>
 
 =cut
