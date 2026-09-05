@@ -1,7 +1,7 @@
 Revision history for Linux-Event-Async
 
-0.001  2026-09-05
-    - First stable release.
+0.002  2026-09-05
+    - First stable release following the 0.001_001 developer version.
     - Require Linux::Event 0.110 and use its public
       Linux::Event::IO::Sock::Stream and Linux::Event::Framer native-consumer
       extension boundary rather than the historical Stream implementation
