@@ -4,9 +4,10 @@
 [`Linux::Event`](https://github.com/haxmeister/perl-linux-event) without making
 the core reactor depend on Future or Future::AsyncAwait.
 
-Version 0.001 focuses on the hot framed-stream receive path. An Async Stream
-owns one persistent native receive Awaitable; receiving a message does not
-allocate a new Future or Awaitable for that message.
+Version 0.002 is the first stable release. It focuses on the hot framed-stream
+receive path. An Async Stream owns one persistent native receive Awaitable;
+receiving a message does not allocate a new Future or Awaitable for that
+message.
 
 ## Requirements
 
@@ -183,7 +184,7 @@ Benchmark scripts are kept in the repository for development comparison; their
 results are evidence for implementation choices, not a performance guarantee
 for arbitrary applications or hardware.
 
-## 0.001 scope
+## 0.002 scope
 
 The first stable release provides:
 
@@ -196,7 +197,7 @@ The first stable release provides:
 - Linux::Event consumer ABI v1 lifetime handling, including reentrant close.
 
 Awaitable accept, drain, timers, process completion, resolver operations, and
-other higher-level operations are future work rather than hidden 0.001 APIs.
+other higher-level operations are future work rather than hidden 0.002 APIs.
 
 See `ASYNC-ROADMAP.md` for the current architecture constraints and next
 extension priorities.
