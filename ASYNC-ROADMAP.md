@@ -11,17 +11,20 @@ longer pending. Linux::Event 0.110 ships the public versioned ordered-byte
 consumer ABI and the public `Linux::Event::IO::Sock::Stream` hierarchy used by
 Linux::Event::Async.
 
-The implemented 0.002 surface is intentionally narrow:
+The implemented 0.002 surface now covers two distinct Stream suspension models:
 
 - Future::AsyncAwait integration;
-- `Linux::Event::Async::Future` for `async sub` results;
-- `Linux::Event::Async::Stream` for framed `SOCK_STREAM` receive;
-- one persistent native receive Awaitable per Stream;
-- receive cancellation, EOF, failure, and reentrant close handling; and
+- `Linux::Event::Async::Future` for `async sub` results and cold one-shot async
+  operations;
+- `Linux::Event::Async::Stream` application readiness through `ready`;
+- outbound readiness across resolution, connect, and optional TLS handshake;
+- one persistent native Awaitable per Stream for framed `recv`;
+- readiness and receive cancellation/failure/reentrant-close handling; and
 - bounded native prefetch for consecutive receives.
 
-The old implementation staging plan is complete. This document now records the
-constraints that must remain true and the direction for work after 0.002.
+The old implementation staging plan is complete. This document records the
+constraints that must remain true and the direction for expanding Async across
+the Linux::Event operations that have a meaningful suspension point.
 
 ## Architectural boundary
 
@@ -34,17 +37,18 @@ Linux::Event remains a callback-first reactor. It owns:
 - TLS;
 - buffering and output queues;
 - backpressure and fairness;
-- deadlines and timeouts; and
+- deadlines and timeouts;
+- kernel event resources and processes; and
 - the versioned native consumer extension ABI.
 
 Linux::Event::Async owns:
 
 - Future::AsyncAwait integration;
-- coroutine-facing receive state;
+- coroutine-facing operation state;
 - the persistent Stream receive Awaitable;
-- async-sub result Futures;
-- cancellation propagation between those Futures and awaited operations; and
-- future async operation adapters built on Linux::Event primitives.
+- async-sub and one-shot operation Futures;
+- cancellation propagation between Futures and awaited operations; and
+- async operation adapters built on Linux::Event primitives.
 
 The dependency direction stays one way:
 
@@ -60,7 +64,10 @@ Linux::Event core must never need Future knowledge to support this distribution.
 
 ## Public extension boundary
 
-Linux::Event::Async must consume only supported Linux::Event public surfaces:
+Linux::Event::Async should prefer supported Linux::Event public surfaces and
+small stable extension boundaries over private XS coupling.
+
+For Stream receive the public boundary is:
 
 - `Linux::Event::IO::Sock::Stream` as the public stream-socket base;
 - `Linux::Event::Framer` for native framing and consumer declaration; and
@@ -70,8 +77,58 @@ The Async distribution vendors the ABI v1 header used to compile its provider.
 That header must stay synchronized with the ABI contract shipped by the minimum
 supported Linux::Event release.
 
+Stream application readiness does not require a consumer-ABI extension. It is a
+one-shot lifecycle transition and is adapted at the Async Stream subclass while
+preserving the normal Linux::Event `on_ready` lifecycle callback.
+
 Async must not link directly against private Linux::Event XS symbols or treat
 historical private implementation package names as application APIs.
+
+## Operation design rule
+
+Not every Linux::Event object needs to become an Awaitable. Operations should be
+awaitable when they have a meaningful external completion event or suspension
+point.
+
+The implementation should then match the operation's frequency and cost:
+
+- **cold one-shot lifecycle operations** may use
+  `Linux::Event::Async::Future` directly;
+- **hot repeated operations** should avoid per-event Future/Awaitable allocation
+  when a reusable native or object-owned Awaitable materially improves the hot
+  path.
+
+Stream readiness and Stream receive intentionally demonstrate both patterns.
+This distinction should guide Listener accept, output drain, timers, datagrams,
+processes, signals, eventfd events, pipes, TTYs, resolver operations, and generic
+fd readiness rather than imposing one mechanism everywhere.
+
+## Stream application readiness
+
+`ready` returns a `Linux::Event::Async::Future` and resolves with the same Stream
+when it becomes application-ready.
+
+For an outbound plain stream the transition includes hostname resolution and
+connection establishment. For a TLS-declared stream it additionally includes
+the handshake, certificate verification, and negotiated transport state such as
+ALPN.
+
+The normal core `on_ready($stream)` callback remains supported. When both styles
+are used, core `on_ready` executes first and Future waiters resume afterward.
+Multiple readiness waiters may observe the one-shot transition.
+
+Cancellation is waiter-local: cancelling one readiness Future does not close the
+Stream and does not cancel other readiness waiters. A new waiter may be created
+while the connection is still pending.
+
+Connection, resolver, transport, TLS, timeout, and setup errors fail pending
+waiters with the Stream's `Linux::Event::Error`. Explicit close before readiness
+uses an `event` / `ready` error. Closing from `on_ready` is historical success,
+not a retroactive connection failure.
+
+A directly adopted plain connected socket is already ready. An accepted plain
+Stream becomes ready only after the Listener's `on_accept` phase and normal
+Stream readiness transition.
 
 ## Stream receive model
 
@@ -93,7 +150,7 @@ The subclass is where Linux::Event resolves and caches protocol policy:
 
 The Async consumer replaces framed callback delivery. `on_message`,
 `on_messages`, and `message_batch_size` cannot be combined with the native
-Async consumer.
+Async consumer. Lifecycle callbacks remain available.
 
 ### Receive state
 
@@ -159,8 +216,9 @@ paths rather than relying only on stress or global-destruction tests.
 
 ## Future model
 
-`Linux::Event::Async::Future` represents an entire asynchronous computation,
-not one Stream message.
+`Linux::Event::Async::Future` represents an asynchronous computation or a cold
+one-shot asynchronous operation. Stream readiness uses it directly; repeated
+Stream receives use the separate persistent Awaitable.
 
 It implements the Future::AsyncAwait Awaitable protocol and native result,
 failure, readiness, cancellation, and cancellation-chain state. It is not a
@@ -178,18 +236,20 @@ be casually traded away:
 
 1. No per-message Future allocation on Stream receive.
 2. No per-message Awaitable allocation on Stream receive.
-3. Native framing remains in Linux::Event.
-4. Linux::Event callback users pay no Future::AsyncAwait dependency or dispatch
+3. Cold one-shot operations do not require specialized native Awaitable state
+   unless measurement justifies it.
+4. Native framing remains in Linux::Event.
+5. Linux::Event callback users pay no Future::AsyncAwait dependency or dispatch
    tax for Async support.
-5. Async buffering remains bounded.
-6. Framing, TLS, and Stream tuning stay class policy rather than being rebuilt
+6. Async buffering remains bounded.
+7. Framing, TLS, and Stream tuning stay class policy rather than being rebuilt
    around each receive operation.
-7. Any optimization must preserve lifecycle correctness under reentrant close,
+8. Any optimization must preserve lifecycle correctness under reentrant close,
    cancellation, EOF, detach, and destruction.
 
 Benchmark results are evidence for these choices, not API guarantees. Changes to
-the receive path should be evaluated with the repository benchmark harnesses on
-multiple payload sizes and should always be paired with correctness tests.
+the hot receive path should be evaluated with the repository benchmark harnesses
+on multiple payload sizes and should always be paired with correctness tests.
 
 ## 0.002 release gates
 
@@ -200,9 +260,11 @@ A 0.002 release candidate should satisfy all of the following:
 - the vendored ABI header matches the supported core ABI;
 - the distribution builds and tests on Perl 5.36 and the current supported Perl;
 - the Future::AsyncAwait alternative-Awaitable conformance tests pass;
-- Stream receive, cancellation, EOF, prefetch, reentrancy, global destruction,
-  and stress tests pass;
-- reentrant Stream close is covered under the host retain/release rule;
+- Stream readiness, receive, cancellation, EOF, prefetch, reentrancy, global
+  destruction, and stress tests pass;
+- readiness tests cover normal outbound connect, failure, cancellation/retry,
+  adopted sockets, explicit pre-ready close, and reentrant close from on_ready;
+- reentrant Stream receive close is covered under the host retain/release rule;
 - `make disttest` passes in a clean distribution tree;
 - current Linux::Event main remains integration-compatible;
 - CPAN metadata declares every runtime and test dependency;
@@ -210,27 +272,31 @@ A 0.002 release candidate should satisfy all of the following:
 - POD, README, Changes, LICENSE, and metadata describe the released architecture
   rather than an unreleased development branch.
 
-## Work after 0.002
+## Next implementation priorities
 
-The next useful layer is not a new event loop abstraction. It is a small set of
-awaitable operations over capabilities Linux::Event already owns.
+The next useful layer is not a new event loop abstraction. It is awaitable
+coverage over capabilities Linux::Event already owns.
 
-Candidate priorities are:
+Connection application readiness is now complete. Candidate priorities are:
 
-1. connection readiness and connection failure;
-2. listener accept;
-3. output drain and write-side completion;
-4. timers;
-5. process completion;
-6. resolver completion; and
-7. other kernel-event operations where an Awaitable materially improves
-   application structure.
+1. listener accept;
+2. Stream output drain and write-side completion;
+3. timers;
+4. datagram receive and output drain;
+5. process completion and process pipe I/O;
+6. signals;
+7. eventfd events;
+8. Pipe and TTY input/output suspension points;
+9. resolver completion; and
+10. generic fd readable/writable readiness as a low-level escape hatch.
 
 Each operation should answer the same questions before becoming public:
 
+- Is the operation cold/one-shot or hot/repeated?
 - Can it reuse stable native or object-owned state rather than allocate an
-  avoidable wrapper on every operation?
-- What owns cancellation?
+  avoidable wrapper on a hot path?
+- What owns cancellation, and does cancellation affect only the wait or the
+  underlying resource operation?
 - Which Loop drives `AWAIT_WAIT`?
 - What happens under close or destruction while a continuation is running?
 - Does exposing it in Async require any change to callback users in core?
@@ -239,8 +305,8 @@ Each operation should answer the same questions before becoming public:
 ## Deferred higher-level work
 
 Structured concurrency, task groups, cancellation scopes, protocol-specific
-clients, HTTP, WebSocket, and application frameworks belong above the 0.002
-primitive layer.
+clients, HTTP, WebSocket, and application frameworks belong above the primitive
+Async layer.
 
 They may eventually use Linux::Event::Async, but they should not force Future or
 protocol semantics back into Linux::Event core.
