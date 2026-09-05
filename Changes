@@ -2,10 +2,9 @@ Revision history for Linux-Event-Async
 
 0.002  2026-09-05
     - First stable release following the 0.001_001 developer version.
-    - Require Linux::Event 0.110 and use its public
-      Linux::Event::IO::Sock::Stream and Linux::Event::Framer native-consumer
-      extension boundary rather than the historical Stream implementation
-      package.
+    - Require Linux::Event 0.110 and use its public resource hierarchy and
+      Linux::Event::Framer native-consumer extension boundary rather than
+      historical implementation package names.
     - Add Stream ready(), returning a Linux::Event::Async::Future that resolves
       with the same Stream at application readiness. Outbound readiness covers
       resolution, connect, and TLS handshake/verification where applicable.
@@ -15,15 +14,34 @@ Revision history for Linux-Event-Async
     - Propagate connection, resolver, transport, TLS, timeout, and setup failures
       through pending readiness Futures using the Stream's Linux::Event::Error;
       explicitly closing before readiness produces an event/ready error.
-    - Add readiness regression coverage for adopted sockets, normal outbound
-      connect, cancellation and retry, reentrant close from on_ready, explicit
-      pre-ready close, connection failure, and detached pending Streams.
+    - Add Stream drain(), returning a Future that waits for an active
+      high-water backpressure period to clear through the configured low
+      watermark. It resolves at the normal Linux::Event drain transition rather
+      than requiring pending_bytes to reach zero.
+    - Reserve the Async Stream on_drain bridge so core callback dispatch and
+      Future completion share one supported boundary. Drain Future cancellation
+      is waiter-local and close/error fails pending drain waiters.
+    - Add Linux::Event::Async::Listener with persistent awaitable accept().
+      Acceptance is pull-based and paused while no wait is armed; cancelling an
+      accept wait does not close the Listener.
+    - Use one level-triggered kernel accept per armed Async Listener wait in
+      0.002 so additional connections remain in the kernel backlog instead of
+      being accepted behind an already completed Awaitable.
+    - Add Linux::Event::Async::Timer with a persistent wait() Awaitable over the
+      public Linux::Event::Kernel::Timer scheduler. Repeated recurring waits do
+      not allocate one Future or Awaitable per tick.
+    - Preserve Timer fixed-rate/coalesced semantics by returning the represented
+      expiration count. Expirations occurring while no wait is armed accumulate
+      in one scalar rather than an unbounded tick queue.
+    - Make Timer wait cancellation wait-local: cancelling the Awaitable or an
+      async sub currently awaiting it leaves the underlying recurring Timer
+      active. Core Timer cancel remains terminal and fails a pending wait.
     - Synchronize the vendored ordered-byte consumer ABI v1 header with the
       released Linux::Event contract, including read-side terminal events and
       host retain/release lifetime operations.
     - Guard callback-capable consumer host resume and pause calls with the ABI
-      retain/release contract so reentrant cancellation callbacks or resumed
-      coroutines may close and destroy the Stream safely.
+      retain/release contract so reentrant Stream close and destruction are
+      safe.
     - Add deterministic regression coverage for reentrant Stream close from a
       receive cancellation callback.
     - Return one persistent native Awaitable view from Stream recv, avoiding one
@@ -31,17 +49,15 @@ Revision history for Linux-Event-Async
     - Keep receive arming in XS and use a bounded 64-message, approximately
       256 KiB prefetch ring. Consecutive receives can consume retained messages
       immediately while bounded pause and backpressure remain intact.
-    - Add concurrency regression coverage for multiple async subs sharing one
-      Loop, out-of-order completion, isolated failure and cancellation, and the
-      single-reader-per-Stream contract.
+    - Add regression coverage for Stream readiness and drain, Listener accept,
+      Timer waits and cancellation, multiple async subs sharing one Loop,
+      out-of-order completion, isolated failure/cancellation, global
+      destruction, and stress lifecycles.
     - Follow the currently awaited Linux::Event Loop when an async sub composes
       sequential operations across different Loops, including through nested
       child async subs, so AWAIT_WAIT does not remain blocked on an earlier
       Loop.
     - Make native consumer teardown safe during Perl global destruction.
-    - Add deterministic stress coverage for many concurrent tasks, shuffled
-      readiness, mixed failures and cancellations, stale completed Futures,
-      nested cancellation, and closing Streams with pending receives.
     - Run release CI against the minimum supported Linux::Event 0.110 on Perl
       5.36 and 5.44 with make test and make disttest, plus a separate integration
       lane against current Linux::Event main.
@@ -50,9 +66,9 @@ Revision history for Linux-Event-Async
     - Add explicit CPAN provides/no_index metadata, repository resources, a
       Linux-only configure guard, and the Perl 5 license.
     - Rewrite public POD, README, and roadmap for the released architecture,
-      including subclass framing/TLS policy, all Async-applicable stream tuning
-      options, application readiness, receive cancellation, bounded prefetch,
-      and first-release scope.
+      including subclass framing/TLS policy, all Async-applicable Stream tuning
+      options, readiness, drain, Listener accept, Timer waits, receive
+      cancellation, bounded prefetch, and first-release scope.
 
 0.001_001  2026-08-30
     - Initial development skeleton for the separate Linux::Event::Async
