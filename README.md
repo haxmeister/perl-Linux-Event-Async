@@ -13,13 +13,14 @@ Version 0.002 is the first stable release. It provides:
 - `Linux::Event::Async::Dgram` with `ready`, `drain`, and persistent pull-based
   packet `recv`;
 - `Linux::Event::Async::Timer` with persistent `wait` and coalesced expiration
-  counts; and
-- `Linux::Event::Async::Process` with Future-based process completion `wait`
-  after pidfd reaping and final stdout/stderr drain.
+  counts;
+- `Linux::Event::Async::Process` with Future-based process completion `wait`;
+- `Linux::Event::Async::Signal` with persistent signalfd `wait`; and
+- `Linux::Event::Async::Event` with persistent eventfd `wait`.
 
 The design keeps Linux::Event callback-first underneath. Async is a language
 surface over the existing epoll, socket, TLS, framing, datagram, backpressure,
-timer, and pidfd process machinery rather than a second event loop.
+timer, pidfd, signalfd, and eventfd machinery rather than a second event loop.
 
 ## Requirements
 
@@ -141,7 +142,7 @@ limit, and timeout values are seconds with zero meaning disabled.
 framed Async Stream. `message_batch_size` belongs to framed callback batching
 and cannot be combined with the Async native consumer.
 
-## Connection readiness
+## Stream readiness, receive, and output
 
 ```perl
 my $stream = SecureLineStream->connect(
@@ -151,71 +152,33 @@ my $stream = SecureLineStream->connect(
 );
 
 await $stream->ready;
-```
-
-`ready` returns a `Linux::Event::Async::Future` resolving with the same Stream.
-For outbound TCP it covers hostname resolution and connection establishment. For
-TLS it additionally covers handshake, certificate verification, and negotiated
-transport state such as ALPN.
-
-Multiple callers may wait for the same one-shot readiness transition. Cancelling
-one readiness Future cancels only that wait and does not close the Stream.
-Connection, resolver, transport, TLS, timeout, and setup failures propagate as
-`Linux::Event::Error` objects.
-
-A directly adopted plain connected socket is already ready. A detached outbound
-Stream must be added to a Loop before a pending readiness Future can be awaited.
-
-## Framed receive
-
-```perl
 my $message = await $stream->recv;
+$stream->send($reply);
+await $stream->drain if $stream->is_write_blocked;
 ```
+
+`ready` is a cold `Linux::Event::Async::Future`. Outbound readiness includes
+hostname resolution and TCP connection establishment; with TLS it also includes
+handshake and verification. Multiple readiness waiters may observe the same
+one-shot transition, and cancelling one waiter does not close the Stream.
 
 `recv` uses one persistent native Awaitable per Stream. There is no per-message
-Future or Awaitable allocation.
-
-The receive contract is:
-
-- one pending receive per Stream;
-- ordered framed delivery;
-- clean EOF resolves to `undef`;
-- I/O, framing, close, detach, and read-side failures throw typed
-  `Linux::Event::Error` values;
-- cancelling a receive does not close the Stream;
-- cancelling a receive does not consume the next message; and
-- cancellation of an async-sub Future propagates to its currently awaited
-  receive.
+Future or Awaitable allocation. Only one receive may be pending. Clean EOF
+resolves to `undef`. Cancelling a receive does not close the Stream or consume
+the next message.
 
 Within one framed-input drain, Async may retain up to 64 additional messages and
 approximately 256 KiB of payload. The byte threshold allows one complete-frame
-overshoot. Once the bound is reached, consumer delivery pauses and normal
-Linux::Event backpressure resumes.
+overshoot. Once bounded prefetch fills, normal Linux::Event consumer pause and
+backpressure resume.
 
 `on_message`, `on_messages`, and `message_batch_size` are incompatible with the
 Async native receive consumer.
 
-## Output backpressure
-
-```perl
-$stream->send($payload);
-await $stream->drain if $stream->is_write_blocked;
-```
-
-`drain` returns a `Linux::Event::Async::Future`. If the Stream is not blocked it
-is already complete. Otherwise it resolves when the current high-water blocked
-period ends as queued output falls through the configured low watermark.
-
-`drain` does **not** mean `pending_bytes == 0`; it means the application may
-resume producing output according to Linux::Event's backpressure policy.
-
-`on_drain` is reserved by `Linux::Event::Async::Stream` as the bridge from the
-core blocked-to-low-water transition to pending drain Futures. Application
-backpressure logic belongs after `await $stream->drain`.
-
-Cancelling one drain Future cancels only that waiter. It neither closes the
-Stream nor discards queued output. Stream close or failure completes pending
-drain waits with an error.
+`drain` is another cold Future. It resolves when an active high-water blocked
+period crosses the configured low watermark. It does **not** promise
+`pending_bytes == 0`. Cancelling one drain Future affects only that waiter.
+`on_drain` is reserved by Async Stream as the exact core-to-Future bridge.
 
 ## Pull-based Listener accept
 
@@ -224,26 +187,17 @@ my $stream = await $listener->accept;
 ```
 
 `Linux::Event::Async::Listener` owns one persistent Awaitable for repeated
-accepts. The returned object is the exact configured `stream_class`; no generic
-connection wrapper is added.
+accepts. The returned object is the exact configured `stream_class`.
 
 Acceptance is paused while no wait is armed. Cancelling an accept wait pauses
-acceptance but does not close the listening socket. This keeps excess incoming
-connections in the kernel backlog rather than building an unbounded queue of
-accepted Stream objects.
-
-For 0.002, Async Listener fixes `max_accept_per_tick => 1` and uses
-level-triggered acceptance. This prevents the core's normal accept batching from
-accepting a tail of connections behind an already completed pull-style
-Awaitable. A future native implementation may add bounded accept prefetch if
-measurement justifies it.
-
-`on_accept` and `on_error` are reserved by `Linux::Event::Async::Listener` as
-its Awaitable bridge.
+acceptance but does not close the Listener. Version 0.002 fixes
+`max_accept_per_tick => 1` and uses level-triggered acceptance so excess
+connections remain in the kernel backlog instead of being accepted behind an
+already completed pull-style Awaitable.
 
 ## Awaitable Datagram I/O
 
-Define Datagram socket policy once on a subclass:
+Define Datagram policy once on a subclass:
 
 ```perl
 package PacketSocket;
@@ -275,20 +229,13 @@ while (1) {
 }
 ```
 
-`recv` uses one persistent Awaitable per Datagram socket. In list context it
-returns payload and `Linux::Event::Address`; in scalar context it returns the
-payload.
+`recv` uses one persistent Awaitable per Datagram socket. List context returns
+payload and `Linux::Event::Address`; scalar context returns payload.
 
-Async Datagram receive is pull-based. Linux::Event normally permits batched
-`recvmsg` work, but a pull Awaitable cannot safely consume only the first packet
-after a tail batch has already been removed from the kernel. Version 0.002
-therefore fixes `max_datagrams_per_tick => 1` and `edge_triggered => 0` for Async
-Dgram. When no receive is pending, read interest is paused and additional
-packets stay in the kernel receive queue.
-
-Cancelling a receive pauses only the wait. It does not close the Datagram socket
-or consume the next packet. Oversized packets and receive failures propagate the
-same typed errors reported by core.
+Async Datagram receive is pull-based. Version 0.002 therefore fixes
+`max_datagrams_per_tick => 1` and `edge_triggered => 0`. When no receive is
+pending, read interest is paused and additional packets remain in the kernel
+receive queue.
 
 The complete effective Async `datagram_options` surface is:
 
@@ -312,16 +259,10 @@ sub datagram_options ($class) {
 }
 ```
 
-The one-packet and level-triggered values are required by the Async pull model;
-the remaining options preserve Linux::Event semantics. Atomic packet boundaries,
-connected/unconnected UDP, Unix-domain datagrams, adopted sockets, peer
-addresses, socket policy, queue limits, and output backpressure remain core
-behavior.
-
-`ready` and `drain` are cold Future waits. `drain` resolves when an output
-high-water blocked period crosses the configured low watermark, not necessarily
-when the packet queue becomes empty. `on_datagram` and `on_drain` are reserved
-by `Linux::Event::Async::Dgram` as its Awaitable bridges.
+Atomic packet boundaries, connected/unconnected UDP, Unix-domain datagrams,
+adopted sockets, peer addresses, queue limits, socket policy, and output
+backpressure remain core behavior. `ready` and `drain` are cold Futures;
+`on_datagram` and `on_drain` are reserved Async bridges.
 
 ## Awaitable Timer
 
@@ -339,31 +280,16 @@ while (1) {
 
 `Linux::Event::Async::Timer` retains the public
 `Linux::Event::Kernel::Timer` scheduler and one persistent Awaitable per Timer.
-Repeated recurring waits therefore do not allocate one Future or Awaitable per
-tick.
+The normal `after`, `at`, and `every` schedules remain available.
 
-The normal Timer schedules remain available:
+Recurring timers remain fixed-rate. Linux::Event coalesces missed periods and
+`wait` returns the represented expiration count. Expirations occurring while no
+wait is armed accumulate in one scalar rather than an unbounded tick queue.
 
-```perl
-after => $seconds
-at    => $monotonic_seconds
-every => $seconds
-```
-
-Recurring timers remain fixed-rate. If the Loop is late, Linux::Event coalesces
-missed periods; `wait` returns that represented expiration count. If expirations
-occur while no wait is armed, Async accumulates the count in one scalar rather
-than creating an unbounded tick queue.
-
-`cancel_wait` cancels only the pending suspension. The underlying recurring
-Timer remains active. Core `$timer->cancel` remains terminal and fails a pending
-wait. `on_timer` is reserved by `Linux::Event::Async::Timer` as its Awaitable
-bridge.
+`cancel_wait` cancels only the suspension. The recurring Timer remains active.
+Core `$timer->cancel` remains terminal and fails a pending wait.
 
 ## Awaitable Process completion
-
-Process completion is a cold one-shot transition, so it uses a normal Async
-Future rather than a persistent Awaitable:
 
 ```perl
 package WorkerProcess;
@@ -384,15 +310,13 @@ await $process->wait;
 say $process->exit_code;
 ```
 
-`Linux::Event::Async::Process` retains the public
-`Linux::Event::Kernel::Process` pidfd lifecycle. Core reaps the child and drains
-remaining stdout/stderr bytes before its reserved `on_exit` bridge completes
-pending wait Futures. Exit status and final output callbacks are therefore
-stable when `await $process->wait` resumes.
+Process completion is a cold one-shot transition, so `wait` returns a normal
+Async Future. Core reaps the pid and drains remaining stdout/stderr bytes before
+the reserved `on_exit` bridge completes waiters. Exit status and final output
+callbacks are therefore stable when `await $process->wait` resumes.
 
-Multiple Futures may wait for the same exit. Cancelling one wait affects only
-that Future: it does not signal, kill, detach, or otherwise alter the Process.
-Process signaling remains explicit through the core `signal` method.
+Multiple callers may wait for the same exit. Cancelling one wait does not
+signal, kill, detach, or otherwise alter the Process.
 
 The complete `process_options` tuning surface remains available:
 
@@ -408,33 +332,72 @@ sub process_options ($class) {
 }
 ```
 
-Version 0.002 intentionally leaves stdout/stderr on the core callback path and
-retains `write_stdin`, `close_stdin`, and `pending_stdin_bytes` as core
-operations. Linux::Event may drain multiple child-pipe reads in one readiness
-turn; a pull-style stdout/stderr API needs an explicit bounded buffering or
-one-read fairness contract before it belongs in Async.
+Version 0.002 leaves stdout/stderr on Linux::Event's established callback-drain
+path and retains `write_stdin`, `close_stdin`, and `pending_stdin_bytes` as core
+operations. A pull-style Process pipe API is deferred until it has an explicit
+bounded buffering or one-read fairness contract.
 
-`on_exit` is reserved by `Linux::Event::Async::Process` for `wait`. Reusable
-stdout/stderr/EOF/error callbacks may still live on the subclass. Per-instance
-callback constructor options are not accepted so the Async Process contract is
-identical on the minimum supported Linux::Event 0.110 and current core.
+## Awaitable Signal delivery
 
-## Future model
+```perl
+use POSIX qw(SIGINT SIGTERM);
+
+my $signal = Linux::Event::Async::Signal->new(
+    loop    => $loop,
+    signals => [SIGINT, SIGTERM],
+);
+
+my ($number, $count) = await $signal->wait;
+```
+
+`Linux::Event::Async::Signal` retains Linux::Event's shared signalfd ownership
+and one persistent Awaitable per subscription. List context returns signal
+number and aggregated signalfd record count; scalar context returns the signal
+number.
+
+A subscription cannot pause only its own fan-out while remaining in the shared
+signalfd service. If notifications arrive while no wait is armed, Async stores
+at most one pending entry per subscribed signal number and accumulates the count
+for that number. The memory bound is therefore the fixed subscription set, not
+the number of delivered notifications.
+
+`cancel_wait` is wait-local. Core `$signal->cancel` remains terminal and fails a
+pending wait. Signal-mask ownership, per-thread masking, and one-Loop-per-signal
+rules remain exactly the core rules. `on_signal` is reserved by Async Signal.
+
+## Awaitable eventfd notification
+
+```perl
+my $event = Linux::Event::Async::Event->new(loop => $loop);
+
+# Producer side: publish payload to its real channel first.
+$event->signal;
+
+my $count = await $event->wait;
+```
+
+`Linux::Event::Async::Event` adapts the public eventfd-backed Event primitive
+with one persistent Awaitable. If the Loop drains eventfd while no wait is armed,
+Async accumulates the delivered count in one scalar. No per-notification object
+or queue entry is allocated.
+
+The eventfd is still a notification mechanism, not a payload channel. Put work
+in the application queue, shared structure, pipe, socket, or other IPC channel
+before signaling; use that payload channel as the source of truth.
+
+`cancel_wait` is wait-local. Core `$event->cancel` remains terminal and fails a
+pending wait. The core thread/fork boundary is preserved: cloned worker handles
+may signal the eventfd but do not own the Loop or Async wait state. `on_event` is
+reserved by Async Event.
+
+## Future and performance model
 
 `Linux::Event::Async::Future` represents an asynchronous computation or a cold
-one-shot wait such as Stream/Dgram readiness or drain and Process exit. It is
-intentionally separate from persistent hot-operation Awaitables.
+one-shot operation. It implements the Future::AsyncAwait Awaitable protocol but
+is not a subclass or complete replacement for the CPAN `Future` distribution.
 
-`AWAIT_WAIT` drives one `run_once(-1)` at a time on the Linux::Event Loop
-associated with the operation currently awaited by the Future. Sequential
-awaits may therefore move between Loops.
-
-The native Future implements the Future::AsyncAwait Awaitable protocol and has
-convenience methods including `done`, `fail`, `get`, `cancel`, `is_ready`,
-`is_cancelled`, `on_ready`, and `on_cancel`. It is not a subclass or complete
-replacement for the CPAN `Future` distribution.
-
-## Performance model
+`AWAIT_WAIT` drives the Linux::Event Loop associated with the operation currently
+awaited by the Future. Sequential awaits may therefore move between Loops.
 
 The operation type determines the suspension mechanism:
 
@@ -444,12 +407,15 @@ cold transition
     Dgram ready / Dgram drain
     Process wait
         -> Linux::Event::Async::Future
-        -> Future::AsyncAwait continuation
 
 hot repeated operation
-    Stream recv / Listener accept / Dgram recv / Timer wait
+    Stream recv
+    Listener accept
+    Dgram recv
+    Timer wait
+    Signal wait
+    Event wait
         -> persistent per-resource Awaitable
-        -> Future::AsyncAwait continuation
 ```
 
 The rule is pragmatic: do not build specialized reusable state for a cold event
@@ -463,11 +429,14 @@ for this distribution.
 
 The first stable release includes Future::AsyncAwait integration, Stream
 readiness/drain/framed receive, pull-based Listener accept, pull-based Datagram
-receive/output backpressure, awaitable Timer expiration, and awaitable Process
-completion. Signals, eventfd events, pull-style Process pipe I/O, Pipe/TTY
-operations, resolver operations, and generic fd readiness remain future work.
+receive/output backpressure, awaitable Timer expiration, awaitable Process
+completion, bounded awaitable Signal delivery, and awaitable eventfd
+notification.
 
-See `ASYNC-ROADMAP.md` for the architecture constraints and extension priorities.
+Pull-style Process pipe I/O, Pipe/TTY operations, standalone resolver operations,
+and generic fd readiness remain future work.
+
+See `ASYNC-ROADMAP.md` for architecture constraints and extension priorities.
 
 ## Installation
 
