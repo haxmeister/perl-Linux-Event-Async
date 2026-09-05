@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   release-gate:
     runs-on: ubuntu-latest
