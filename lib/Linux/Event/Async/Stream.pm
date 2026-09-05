@@ -44,8 +44,15 @@ sub _ready_waiter_failure ($self) {
     );
 }
 
-sub _finish_ready_waiters ($self, $mode, $value) {
-    my $waiters = delete $self->{_async_ready_waiters} // [];
+sub _drain_waiter_failure ($self) {
+    return $self->last_error // Linux::Event::Error->new(
+        type      => 'event',
+        operation => 'drain',
+        message   => 'Stream closed before output backpressure drained',
+    );
+}
+
+sub _finish_waiter_list ($self, $waiters, $mode, $value) {
     my $failure;
 
     for my $future (@$waiters) {
@@ -63,6 +70,16 @@ sub _finish_ready_waiters ($self, $mode, $value) {
     return $failure;
 }
 
+sub _finish_ready_waiters ($self, $mode, $value) {
+    my $waiters = delete $self->{_async_ready_waiters} // [];
+    return $self->_finish_waiter_list($waiters, $mode, $value);
+}
+
+sub _finish_drain_waiters ($self, $mode, $value) {
+    my $waiters = delete $self->{_async_drain_waiters} // [];
+    return $self->_finish_waiter_list($waiters, $mode, $value);
+}
+
 sub ready ($self) {
     my $future = Linux::Event::Async::Future->new(loop => $self->loop);
 
@@ -77,6 +94,23 @@ sub ready ($self) {
 
     push @{ $self->{_async_ready_waiters} //= [] }, $future;
     weaken($self->{_async_ready_waiters}[-1]);
+    return $future;
+}
+
+sub drain ($self) {
+    my $future = Linux::Event::Async::Future->new(loop => $self->loop);
+
+    if ($self->is_closed) {
+        return $future->fail($self->_drain_waiter_failure);
+    }
+    if (!$self->is_write_blocked) {
+        return $future->done($self);
+    }
+    croak 'drain(): blocked Stream must be attached to a Linux::Event loop'
+        if !$self->loop;
+
+    push @{ $self->{_async_drain_waiters} //= [] }, $future;
+    weaken($self->{_async_drain_waiters}[-1]);
     return $future;
 }
 
@@ -98,6 +132,32 @@ sub _fire_ready ($self) {
     return;
 }
 
+sub _xs_drain ($self) {
+    return $self->SUPER::_xs_drain if $self->is_closed;
+
+    # Core may report a preconnect low-water transition before application
+    # readiness, but deliberately defers on_drain until the connection becomes
+    # usable. Match that behavior rather than completing an Async drain early.
+    my $deferred = $self->{preconnect_write_blocked}
+        && !(($self->{transport_ready_fired} // 0) & 0x02);
+
+    # Once a real drain transition has occurred, detach its waiters before the
+    # user on_drain callback runs. A reentrant close or a new write that blocks
+    # again cannot retroactively turn the completed transition into failure.
+    my $waiters = $deferred
+        ? [] : delete($self->{_async_drain_waiters}) // [];
+
+    my $core_failure;
+    my $ok = eval { $self->SUPER::_xs_drain; 1 };
+    $core_failure = $@ if !$ok;
+
+    my $future_failure
+        = $self->_finish_waiter_list($waiters, 'done', $self);
+    die $core_failure if defined($core_failure) && length($core_failure);
+    die $future_failure if defined($future_failure) && length($future_failure);
+    return;
+}
+
 sub _close_now ($self, $close_fh) {
     my $fail_ready = !$self->{_async_ready_established};
 
@@ -111,6 +171,10 @@ sub _close_now ($self, $close_fh) {
             'fail', $self->_ready_waiter_failure,
         );
     }
+    my $drain_failure = $self->_finish_drain_waiters(
+        'fail', $self->_drain_waiter_failure,
+    );
+    $future_failure //= $drain_failure;
 
     die $core_failure if defined($core_failure) && length($core_failure);
     die $future_failure if defined($future_failure) && length($future_failure);
@@ -181,6 +245,7 @@ Linux::Event::Async::Stream - awaitable framed SOCK_STREAM connections
   async sub request ($stream) {
       await $stream->ready;
       $stream->send('hello');
+      await $stream->drain if $stream->is_write_blocked;
       return await $stream->recv;
   }
 
@@ -189,8 +254,8 @@ Linux::Event::Async::Stream - awaitable framed SOCK_STREAM connections
 C<Linux::Event::Async::Stream> is the async specialization of
 L<Linux::Event::IO::Sock::Stream>. It preserves Linux::Event's native socket,
 TLS, framing, buffering, backpressure, timeout, and tuning machinery while
-adding Awaitable connection readiness and replacing framed message callbacks
-with a reusable Awaitable receive path.
+adding Awaitable application readiness and output drain plus a reusable
+Awaitable framed receive path.
 
 A concrete protocol subclass declares a built-in native framer with
 L<Linux::Event::Framer>. Linux::Event resolves the framer, tuning, TLS policy,
@@ -203,10 +268,10 @@ C<Linux::Event::Async::Stream::Awaitable> view. C<recv> arms that context and
 returns the same Awaitable view for each generation. No Future or Awaitable is
 allocated per received message.
 
-Connection readiness is different: it is a cold one-shot lifecycle event, so
-C<ready> returns a L<Linux::Event::Async::Future>. This keeps the hot receive
-path allocation-free without adding specialized native state for an operation
-that occurs only once per connection.
+Readiness and drain are different: they observe comparatively cold lifecycle or
+backpressure transitions and return L<Linux::Event::Async::Future> objects. This
+keeps the hot receive path allocation-free without requiring specialized native
+state for every one-shot wait.
 
 =head1 SUBCLASSING, FRAMING, TLS, AND TUNING
 
@@ -314,6 +379,43 @@ and then awaited:
   $loop->add($stream);
   await $stream->ready;
 
+=head1 OUTPUT BACKPRESSURE
+
+=head2 drain
+
+  $stream->send($payload);
+  await $stream->drain if $stream->is_write_blocked;
+
+C<drain> returns a L<Linux::Event::Async::Future>. If the Stream is not currently
+write-blocked, the Future is already complete. If output has crossed the
+configured C<high_watermark>, the Future waits for that blocked period to end
+when queued output falls through the C<low_watermark>. The Future resolves with
+the Stream.
+
+C<drain> observes Linux::Event's cooperative backpressure transition; it does
+not promise that C<pending_bytes> is zero. Code that merely needs permission to
+produce more output should wait for C<drain>, not busy-wait for an empty queue.
+
+The core C<on_drain($stream)> lifecycle callback remains supported and runs
+before drain Future waiters resume. The drain transition is recorded before the
+callback runs, so a callback that closes the Stream or immediately writes enough
+data to become blocked again does not retroactively fail waiters for the drain
+that already occurred.
+
+Multiple Futures may wait on one blocked period. Cancelling one drain Future
+cancels only that wait; it neither closes the Stream nor discards queued output.
+A Stream error or explicit close before the blocked period drains fails pending
+waiters with the Stream's L<Linux::Event::Error> or an C<event>/C<drain> error.
+
+Preconnect backpressure preserves core ordering: if writes cross the high
+watermark before an outbound connection becomes application-ready, C<drain>
+does not complete on an internal preconnect low-water transition. It completes
+only when Linux::Event exposes the normal post-readiness drain transition.
+
+A blocked Stream must be attached to a Loop before C<drain> can create a pending
+wait. An unblocked Stream may return an immediately completed drain Future even
+when no Loop is needed.
+
 =head1 RECEIVE API
 
 =head2 recv
@@ -366,9 +468,9 @@ restriction applies only to framed message delivery.
 
 =head1 OUTPUT
 
-Output remains the ordinary Linux::Event Stream API. C<write($bytes)> writes raw
-ordered bytes, while C<send($payload)> applies the subclass's declared framer.
-Output queue limits, watermarks, drain behavior, half-close, and TLS encryption
+Output otherwise remains the ordinary Linux::Event Stream API. C<write($bytes)>
+writes raw ordered bytes, while C<send($payload)> applies the subclass's
+declared framer. Output queue limits, watermarks, half-close, and TLS encryption
 are handled by L<Linux::Event::IO::Sock::Stream>.
 
 =head1 AWAITABLE LIFETIME
@@ -383,10 +485,10 @@ contract so a callback or resumed coroutine may close the Stream reentrantly
 without leaving the native receive frame with a dangling host or provider
 context.
 
-C<ready> uses ordinary L<Linux::Event::Async::Future> instances because
-connection readiness is one-shot and outside the message-delivery hot path.
-Readiness waiters are held weakly by the Stream, so a discarded waiter does not
-create a Stream/Future ownership cycle.
+C<ready> and C<drain> use ordinary L<Linux::Event::Async::Future> instances
+because their transitions are outside the repeated message-delivery hot path.
+Stream waiter lists hold weak Future references, so discarded or cancelled
+operation Futures do not create Stream/Future ownership cycles.
 
 =head1 WAITING
 
@@ -395,7 +497,7 @@ Stream's attached Loop until the receive is ready, then returns or throws with
 C<AWAIT_GET> semantics. Waiting on a pending receive whose Stream is not
 attached to a Loop throws.
 
-Readiness Futures use the same Loop through
+Readiness and drain Futures use the same Loop through
 L<Linux::Event::Async::Future/AWAIT_WAIT>.
 
 =head1 REQUIREMENTS
