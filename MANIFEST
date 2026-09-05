@@ -10,6 +10,7 @@ lib/Linux/Event/Async.pm
 lib/Linux/Event/Async/Future.pm
 lib/Linux/Event/Async/Listener.pm
 lib/Linux/Event/Async/Stream.pm
+lib/Linux/Event/Async/Timer.pm
 t/00-load.t
 t/01-future.t
 t/02-awaitable.t
@@ -17,6 +18,7 @@ t/10-stream.t
 t/11-stream-ready.t
 t/12-listener.t
 t/13-stream-drain.t
+t/14-timer.t
 t/20-concurrency.t
 t/21-global-destruction.t
 t/22-stress.t
