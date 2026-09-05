@@ -25,40 +25,29 @@ use Linux::Event::Async;
     sub stream_options ($class) {
         return high_watermark => 4096, low_watermark => 1024;
     }
-    sub on_drain ($stream) {
-        push @{ $stream->data->{order} }, 'callback';
-        return;
-    }
 }
 
 {
-    package T::DrainCloseWriter;
+    package T::BadDrainWriter;
     use parent 'Linux::Event::Async::Stream';
     use Linux::Event::Framer 'Delimiter', "\n";
-    sub stream_options ($class) {
-        return high_watermark => 4096, low_watermark => 1024;
-    }
-    sub on_drain ($stream) {
-        push @{ $stream->data->{order} }, 'callback';
-        $stream->close;
-        return;
-    }
+    sub on_drain ($stream) { return }
 }
 
-sub pair ($writer_class = 'T::DrainWriter', $with_loop = 1) {
+sub pair ($with_loop = 1) {
     socketpair(my $a, my $b, AF_UNIX, SOCK_STREAM, PF_UNSPEC)
         or die "socketpair: $!";
     setsockopt($a, SOL_SOCKET, SO_SNDBUF, pack('i', 4096))
         or die "setsockopt SO_SNDBUF: $!";
 
     my $loop = $with_loop ? Linux::Event::Loop->new : undef;
-    my $state = { received => 0, order => [] };
+    my $state = { received => 0 };
     my $reader = T::DrainReader->new(
         ($loop ? (loop => $loop) : ()),
         fh   => $b,
         data => $state,
     );
-    my $writer = $writer_class->new(
+    my $writer = T::DrainWriter->new(
         ($loop ? (loop => $loop) : ()),
         fh   => $a,
         data => $state,
@@ -87,15 +76,12 @@ my $payload = 'x' x (2 * 1024 * 1024);
 
     my $drain = $writer->drain;
     ok(!$drain->is_ready, 'drain waits while output is write-blocked');
-    $drain->on_ready(sub { push @{ $state->{order} }, 'future' });
     my $result = $drain->AWAIT_WAIT;
 
     is(refaddr($result), refaddr($writer),
         'drain resolves with the same Stream');
     ok(!$writer->is_write_blocked,
         'drain completes after blocked period clears');
-    is_deeply($state->{order}, [qw(callback future)],
-        'core on_drain callback runs before drain Future resumes');
 
     close_stream($writer);
     close_stream($reader);
@@ -141,17 +127,16 @@ my $payload = 'x' x (2 * 1024 * 1024);
 }
 
 {
-    my ($loop, $reader, $writer, $state) = pair('T::DrainCloseWriter');
+    my ($loop, $reader, $writer, $state) = pair();
     ok(!$writer->write($payload), 'writer blocks for reentrant-close test');
     my $drain = $writer->drain;
+    $drain->on_ready(sub { $writer->close });
     my $result = $drain->AWAIT_WAIT;
 
     ok($writer->is_closed,
-        'core on_drain callback may close Stream reentrantly');
+        'drain continuation may close Stream reentrantly');
     is(refaddr($result), refaddr($writer),
         'reentrant close does not retroactively fail completed drain');
-    is_deeply($state->{order}, ['callback'],
-        'on_drain callback ran before successful drain completion');
 
     close_stream($reader);
 }
@@ -176,7 +161,7 @@ my $payload = 'x' x (2 * 1024 * 1024);
 }
 
 {
-    my ($loop, $reader, $writer, $state) = pair('T::DrainWriter', 0);
+    my ($loop, $reader, $writer, $state) = pair(0);
     ok(!$writer->write($payload), 'detached writer becomes write-blocked');
     my $error = eval { $writer->drain; 1 } ? '' : $@;
     like($error, qr/blocked Stream must be attached/,
@@ -184,6 +169,29 @@ my $payload = 'x' x (2 * 1024 * 1024);
 
     close_stream($writer);
     close_stream($reader);
+}
+
+{
+    socketpair(my $a, my $b, AF_UNIX, SOCK_STREAM, PF_UNSPEC)
+        or die "socketpair: $!";
+    my $error = eval { T::BadDrainWriter->new(fh => $a); 1 } ? '' : $@;
+    like($error, qr/must not override on_drain/,
+        'Async Stream reserves on_drain as the drain bridge');
+    close $a if defined fileno($a);
+    close $b if defined fileno($b);
+}
+
+{
+    socketpair(my $a, my $b, AF_UNIX, SOCK_STREAM, PF_UNSPEC)
+        or die "socketpair: $!";
+    my $error = eval {
+        T::DrainWriter->new(fh => $a, on_drain => sub { return });
+        1;
+    } ? '' : $@;
+    like($error, qr/on_drain is reserved/,
+        'constructor on_drain callback cannot bypass async drain bridge');
+    close $a if defined fileno($a);
+    close $b if defined fileno($b);
 }
 
 done_testing;
