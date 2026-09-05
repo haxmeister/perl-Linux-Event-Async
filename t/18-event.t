@@ -3,6 +3,7 @@ use strict;
 use warnings;
 
 use Test::More;
+use Config ();
 use Scalar::Util qw(refaddr);
 
 use Linux::Event::Loop;
@@ -134,6 +135,36 @@ alarm 30;
         'resumed coroutine receives Event count before cancelling resource');
     ok($event->is_terminal,
         'Event may be cancelled reentrantly from resumed coroutine');
+}
+
+SKIP: {
+    skip 'Perl was built without ithreads', 4
+        if !$Config::Config{useithreads};
+
+    $phase = 'ithread Event signaling boundary';
+    require threads;
+
+    my $loop = Linux::Event::Loop->new;
+    my $event = Linux::Event::Async::Event->new(loop => $loop);
+    my $wait = $event->wait;
+
+    my $worker = threads->create(sub {
+        my ($ok, $error) = thrown(sub { $event->wait });
+        $event->signal(9);
+        return [$ok, "$error"];
+    });
+    my $worker_result = $worker->join;
+
+    ok(!$worker_result->[0],
+        'ithread Event clone cannot own Async wait state');
+    like($worker_result->[1], qr/Async::Event state is unavailable/,
+        'ithread wait rejection identifies unavailable Async owner state');
+    is($wait->AWAIT_WAIT, 9,
+        'ithread Event clone can signal owner-side pending wait');
+    ok($event->is_active,
+        'worker signaling leaves owner-side Event active');
+
+    $event->cancel;
 }
 
 {
