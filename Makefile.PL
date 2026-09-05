@@ -13,7 +13,7 @@ WriteMakefile(
     DIR => ['xsfuture'],
     PREREQ_PM => {
         'Future::AsyncAwait' => '0.71',
-        'Linux::Event'       => '0.112',
+        'Linux::Event'       => '0.110',
     },
     TEST_REQUIRES => {
         'Test::More' => 0,
