@@ -27,6 +27,19 @@ Revision history for Linux-Event-Async
     - Use one level-triggered kernel accept per armed Async Listener wait in
       0.002 so additional connections remain in the kernel backlog instead of
       being accepted behind an already completed Awaitable.
+    - Add Linux::Event::Async::Dgram with Future-based ready()/drain() and one
+      persistent Awaitable for repeated packet recv(). List context returns
+      payload plus Linux::Event::Address; scalar context returns payload.
+    - Make Async Datagram receive pull-based by fixing
+      max_datagrams_per_tick => 1 and edge_triggered => 0. This prevents core
+      recv batching from removing packets behind an already completed Awaitable;
+      additional packets stay in the kernel receive queue until the next recv().
+    - Preserve Datagram atomic send semantics and output watermarks. drain()
+      waits for a high-water blocked period to cross the configured low
+      watermark, while cancellation remains waiter-local.
+    - Route Datagram oversized-packet and I/O failures through pending receives
+      after the normal subclass on_error callback, and cover UDP ordering,
+      cancellation/retry, close, error ordering, and real output backpressure.
     - Add Linux::Event::Async::Timer with a persistent wait() Awaitable over the
       public Linux::Event::Kernel::Timer scheduler. Repeated recurring waits do
       not allocate one Future or Awaitable per tick.
@@ -50,9 +63,9 @@ Revision history for Linux-Event-Async
       256 KiB prefetch ring. Consecutive receives can consume retained messages
       immediately while bounded pause and backpressure remain intact.
     - Add regression coverage for Stream readiness and drain, Listener accept,
-      Timer waits and cancellation, multiple async subs sharing one Loop,
-      out-of-order completion, isolated failure/cancellation, global
-      destruction, and stress lifecycles.
+      Datagram receive/drain, Timer waits and cancellation, multiple async subs
+      sharing one Loop, out-of-order completion, isolated failure/cancellation,
+      global destruction, and stress lifecycles.
     - Follow the currently awaited Linux::Event Loop when an async sub composes
       sequential operations across different Loops, including through nested
       child async subs, so AWAIT_WAIT does not remain blocked on an earlier
@@ -66,9 +79,9 @@ Revision history for Linux-Event-Async
     - Add explicit CPAN provides/no_index metadata, repository resources, a
       Linux-only configure guard, and the Perl 5 license.
     - Rewrite public POD, README, and roadmap for the released architecture,
-      including subclass framing/TLS policy, all Async-applicable Stream tuning
-      options, readiness, drain, Listener accept, Timer waits, receive
-      cancellation, bounded prefetch, and first-release scope.
+      including subclass framing/TLS policy, Stream and Datagram tuning,
+      readiness, drain, Listener accept, Datagram packet receive, Timer waits,
+      receive cancellation, bounded prefetch, and first-release scope.
 
 0.001_001  2026-08-30
     - Initial development skeleton for the separate Linux::Event::Async
