@@ -98,3 +98,47 @@ jobs:
           perl Makefile.PL
           make -j2
           make test
+
+  threaded-integration:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Linux::Event::Async
+        uses: actions/checkout@v4
+        with:
+          path: async
+
+      - name: Check out minimum supported Linux::Event
+        uses: actions/checkout@v4
+        with:
+          repository: haxmeister/perl-linux-event
+          ref: v0.110
+          path: linux-event
+
+      - name: Set up threaded Perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.44'
+          multi-thread: true
+
+      - name: Install build dependencies
+        run: |
+          cpanm --notest Future::AsyncAwait
+          cd linux-event
+          cpanm --notest --installdeps .
+
+      - name: Build and test threaded Linux::Event 0.110
+        run: |
+          cd linux-event
+          perl Makefile.PL
+          make -j2
+          make test
+          make install
+
+      - name: Test Linux::Event::Async on threaded Perl
+        run: |
+          cd async
+          cpanm --notest --installdeps .
+          perl Makefile.PL
+          make -j2
+          make test
