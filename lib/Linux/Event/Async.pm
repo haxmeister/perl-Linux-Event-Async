@@ -30,8 +30,17 @@ Linux::Event::Async - async/await integration for Linux::Event
 
   package main;
   use Linux::Event::Async;
+  use Linux::Event::Loop;
+
+  my $loop = Linux::Event::Loop->new;
+  my $stream = LineStream->connect(
+      loop => $loop,
+      host => '127.0.0.1',
+      port => 9999,
+  );
 
   async sub consume ($stream) {
+      await $stream->ready;
       while (defined(my $message = await $stream->recv)) {
           say $message;
       }
@@ -42,26 +51,28 @@ Linux::Event::Async - async/await integration for Linux::Event
 
 =head1 DESCRIPTION
 
-C<Linux::Event::Async> adds Future::AsyncAwait syntax and Awaitable objects to
-the callback-first L<Linux::Event> reactor. It is a separate distribution so
+C<Linux::Event::Async> adds Future::AsyncAwait syntax and Awaitable operations
+to the callback-first L<Linux::Event> reactor. It is a separate distribution so
 Linux::Event itself remains independent of Future and Future::AsyncAwait.
 
 Importing this module installs C<async> and C<await> through
 L<Future::AsyncAwait> and selects L<Linux::Event::Async::Future> as the Future
 class used for C<async sub> results.
 
-The first stable release concentrates on framed stream receive. A
-L<Linux::Event::Async::Stream> owns one persistent native receive Awaitable.
-C<recv> arms that state and returns the same Awaitable view for each receive;
-it does not allocate one Future or one Awaitable per message. The Future for an
-entire C<async sub> remains a normal independently owned object.
+The first stable release covers two Stream suspension patterns. Application
+readiness is a cold one-shot lifecycle operation and C<< $stream->ready >>
+returns an ordinary L<Linux::Event::Async::Future>. Framed receive is a hot
+repeated operation, so L<Linux::Event::Async::Stream> owns one persistent native
+receive Awaitable; C<recv> does not allocate one Future or Awaitable per
+message.
 
 =head1 ARCHITECTURE
 
 Linux::Event continues to own epoll dispatch, socket lifecycle, TLS, framing,
-buffering, backpressure, fairness, and the versioned native consumer ABI.
-Linux::Event::Async owns coroutine-facing receive state, Future::AsyncAwait
-integration, cancellation semantics, and async-sub result Futures.
+buffering, backpressure, fairness, deadlines, and the versioned native consumer
+ABI. Linux::Event::Async owns coroutine-facing suspension state,
+Future::AsyncAwait integration, cancellation semantics, async-sub result
+Futures, and operation adapters over Linux::Event resources.
 
 The dependency direction is intentionally one way:
 
@@ -78,13 +89,18 @@ framers with L<Linux::Event::Framer>. That subclass retains the normal
 Linux::Event stream policy surface, including C<stream_options>, socket policy,
 and declarative L<Linux::Event::TLS> configuration.
 
+For an outbound connection, C<< await $stream->ready >> waits until the Stream
+is application-ready. For TLS that means after handshake and verification, not
+merely after TCP connection. The normal C<on_ready> lifecycle callback remains
+available and runs before readiness Future waiters resume.
+
 Only one receive may be pending on a Stream. Clean EOF resolves to C<undef>.
 Cancelling a pending receive does not close the Stream and does not consume the
 next message. I/O, framing, and lifecycle failures are delivered as the typed
 errors supplied by Linux::Event.
 
-See L<Linux::Event::Async::Stream> for the complete receive contract and tuning
-model.
+See L<Linux::Event::Async::Stream> for the complete readiness, receive,
+cancellation, framing, TLS, and tuning contract.
 
 =head1 DRIVING ASYNC WORK
 
@@ -104,10 +120,12 @@ newer, and Future::AsyncAwait 0.71 or newer.
 
 =head1 FIRST RELEASE SCOPE
 
-Version 0.002 provides the async-sub Future implementation and framed
-C<SOCK_STREAM> receive path. Additional awaitable operations such as accept,
-drain, timers, process completion, and resolver work are future extensions and
-are not part of the 0.002 API contract.
+Version 0.002 provides the async-sub Future implementation, awaitable Stream
+application readiness, and framed C<SOCK_STREAM> receive. Additional awaitable
+operations such as listener accept, output drain, timers, datagrams, process
+completion, signals, eventfd events, pipe/TTY operations, resolver operations,
+and generic fd readiness are future extensions and are not part of the 0.002
+API contract.
 
 =head1 SEE ALSO
 
