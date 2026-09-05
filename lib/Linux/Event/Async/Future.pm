@@ -57,15 +57,15 @@ __END__
 
 =head1 NAME
 
-Linux::Event::Async::Future - async-sub result Future for Linux::Event
+Linux::Event::Async::Future - native Future for Linux::Event async operations
 
 =head1 SYNOPSIS
 
   use Linux::Event::Async;
 
   async sub operation ($stream) {
-      my $message = await $stream->recv;
-      return $message;
+      await $stream->ready;
+      return await $stream->recv;
   }
 
   my $future = operation($stream);
@@ -74,13 +74,17 @@ Linux::Event::Async::Future - async-sub result Future for Linux::Event
 =head1 DESCRIPTION
 
 C<Linux::Event::Async::Future> is the native Future class selected by
-L<Linux::Event::Async> for results of C<async sub> declarations. It implements
-the Awaitable protocol expected by L<Future::AsyncAwait> while keeping the
-result state and common completion operations in XS.
+L<Linux::Event::Async> for results of C<async sub> declarations. It is also used
+directly for cold one-shot asynchronous operations such as
+C<< $stream->ready >>. It implements the Awaitable protocol expected by
+L<Future::AsyncAwait> while keeping result, failure, readiness, cancellation,
+and cancellation-chain state in XS.
 
-This object represents an entire asynchronous computation. Stream receives use
-a different persistent L<Linux::Event::Async::Stream> Awaitable and therefore
-do not allocate one Future for each incoming message.
+Hot repeated Stream receives use a different persistent
+L<Linux::Event::Async::Stream> Awaitable and therefore do not allocate one
+Future for each incoming message. This distinction lets one-shot lifecycle
+operations use a simple Future without imposing per-message allocation on the
+receive hot path.
 
 C<Linux::Event::Async::Future> is not a subclass of L<Future> and should not be
 assumed to implement the complete API of that distribution. Use the methods
@@ -95,7 +99,9 @@ documented here and the Future::AsyncAwait Awaitable protocol.
 
 Creates a pending Future. The optional Linux::Event Loop is used by
 C<AWAIT_WAIT>. Futures created internally for an C<async sub> follow the Loop
-associated with the operation currently awaited by that computation.
+associated with the operation currently awaited by that computation. One-shot
+operation Futures such as Stream readiness are created with the resource's
+attached Loop.
 
 =head1 COMPLETION
 
@@ -118,9 +124,13 @@ throws that value.
   $future->cancel;
 
 Cancels a pending Future and propagates cancellation through the currently
-chained Awaitable operation when applicable. Cancelling an async-sub Future
-that is waiting for C<< $stream->recv >> cancels that receive without closing
-the Stream.
+chained Awaitable operation when applicable. Cancelling an async-sub Future that
+is waiting for C<< $stream->recv >> cancels that receive without closing the
+Stream.
+
+Cancellation semantics for a directly returned operation Future belong to that
+operation. For example, cancelling C<< $stream->ready >> cancels only that
+readiness wait; it does not close or cancel the Stream connection.
 
 =head1 OBSERVATION
 
@@ -161,7 +171,8 @@ Registers a callback for cancellation and returns the Future.
 Drives one C<run_once(-1)> operation at a time on the Linux::Event Loop
 associated with the operation currently awaited by the async sub. Effective
 Loop lookup follows nested child Futures and is repeated between dispatches, so
-sequential awaits may move between different Loops.
+sequential awaits may move between different Loops. A directly created
+one-shot operation Future uses its configured Loop.
 
 C<AWAIT_WAIT> returns or throws with the same semantics as C<AWAIT_GET>. It
 throws if the Future is pending but no Linux::Event Loop can be associated with
