@@ -10,6 +10,7 @@ use Linux::Event::Async::Future ();
 use Linux::Event::Async::Stream ();
 use Linux::Event::Async::Listener ();
 use Linux::Event::Async::Timer ();
+use Linux::Event::Async::Dgram ();
 
 sub import {
     @_ = ('Future::AsyncAwait', future_class => 'Linux::Event::Async::Future');
@@ -67,17 +68,17 @@ L<Future::AsyncAwait> and selects L<Linux::Event::Async::Future> as the Future
 class used for C<async sub> results.
 
 Version 0.002 deliberately uses two suspension models. Cold lifecycle or
-backpressure transitions such as Stream C<ready> and C<drain> return ordinary
-L<Linux::Event::Async::Future> objects. Hot repeated operations such as framed
-Stream C<recv>, Listener C<accept>, and Timer C<wait> use persistent
-per-resource Awaitables so steady-state loops avoid one Future or Awaitable
-allocation per event.
+backpressure transitions such as Stream/Dgram C<ready> and C<drain> return
+ordinary L<Linux::Event::Async::Future> objects. Hot repeated operations such as
+framed Stream C<recv>, Dgram C<recv>, Listener C<accept>, and Timer C<wait> use
+persistent per-resource Awaitables so steady-state loops avoid one Future or
+Awaitable allocation per event.
 
 =head1 ARCHITECTURE
 
 Linux::Event continues to own epoll dispatch, socket lifecycle, bind/listen and
-accept4, TLS, framing, buffering, backpressure, fairness, monotonic timer
-scheduling, deadlines, and the versioned native consumer ABI.
+accept4, datagram packet I/O, TLS, framing, buffering, backpressure, fairness,
+monotonic timer scheduling, deadlines, and the versioned native consumer ABI.
 Linux::Event::Async owns coroutine-facing suspension state,
 Future::AsyncAwait integration, cancellation semantics, async-sub result
 Futures, and operation adapters over Linux::Event resources.
@@ -126,6 +127,22 @@ and discarded behind a completed Awaitable.
 Use an L<Linux::Event::Async::Stream> subclass as C<stream_class> for a complete
 coroutine path from accept through application readiness, framed receive, and
 backpressured output.
+
+=head1 DATAGRAM MODEL
+
+L<Linux::Event::Async::Dgram> adapts the public
+L<Linux::Event::IO::Sock::Dgram> API. C<< await $socket->recv >> returns one
+packet, with the peer address as a second result in list context, and reuses one
+persistent Awaitable across receives.
+
+Datagram receive is pull-based. Async fixes receive fairness to one
+level-triggered packet per armed wait so packets beyond the completed Awaitable
+remain in the kernel receive queue rather than being removed by core batching.
+C<ready> and output C<drain> remain ordinary Future waits.
+
+Bound UDP, connected UDP, Unix-domain datagrams, adopted sockets, atomic packet
+boundaries, peer addresses, queue limits, socket policy, and output backpressure
+remain Linux::Event core behavior.
 
 =head1 TIMER MODEL
 
@@ -177,19 +194,24 @@ L<Linux::Event::Async::Listener> persistent C<accept>;
 
 =item *
 
+L<Linux::Event::Async::Dgram> application C<ready>, output C<drain>, and
+persistent packet C<recv>;
+
+=item *
+
 L<Linux::Event::Async::Timer> persistent C<wait> with coalesced expiration
 counts.
 
 =back
 
-Datagram operations, process completion, signals, eventfd events, pipe/TTY
-operations, resolver operations, and generic fd readiness remain future
-extensions rather than hidden 0.002 APIs.
+Process completion, signals, eventfd events, pipe/TTY operations, resolver
+operations, and generic fd readiness remain future extensions rather than
+hidden 0.002 APIs.
 
 =head1 SEE ALSO
 
 L<Linux::Event::Async::Listener>, L<Linux::Event::Async::Stream>,
-L<Linux::Event::Async::Timer>, L<Linux::Event::Async::Future>,
-L<Linux::Event>, L<Future::AsyncAwait>
+L<Linux::Event::Async::Dgram>, L<Linux::Event::Async::Timer>,
+L<Linux::Event::Async::Future>, L<Linux::Event>, L<Future::AsyncAwait>
 
 =cut
