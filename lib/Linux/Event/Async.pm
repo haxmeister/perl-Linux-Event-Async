@@ -11,6 +11,7 @@ use Linux::Event::Async::Stream ();
 use Linux::Event::Async::Listener ();
 use Linux::Event::Async::Timer ();
 use Linux::Event::Async::Dgram ();
+use Linux::Event::Async::Process ();
 
 sub import {
     @_ = ('Future::AsyncAwait', future_class => 'Linux::Event::Async::Future');
@@ -68,20 +69,21 @@ L<Future::AsyncAwait> and selects L<Linux::Event::Async::Future> as the Future
 class used for C<async sub> results.
 
 Version 0.002 deliberately uses two suspension models. Cold lifecycle or
-backpressure transitions such as Stream/Dgram C<ready> and C<drain> return
-ordinary L<Linux::Event::Async::Future> objects. Hot repeated operations such as
-framed Stream C<recv>, Dgram C<recv>, Listener C<accept>, and Timer C<wait> use
-persistent per-resource Awaitables so steady-state loops avoid one Future or
-Awaitable allocation per event.
+backpressure transitions such as Stream/Dgram C<ready>, Stream/Dgram C<drain>,
+and Process C<wait> return ordinary L<Linux::Event::Async::Future> objects. Hot
+repeated operations such as framed Stream C<recv>, Dgram C<recv>, Listener
+C<accept>, and Timer C<wait> use persistent per-resource Awaitables so
+steady-state loops avoid one Future or Awaitable allocation per event.
 
 =head1 ARCHITECTURE
 
 Linux::Event continues to own epoll dispatch, socket lifecycle, bind/listen and
 accept4, datagram packet I/O, TLS, framing, buffering, backpressure, fairness,
-monotonic timer scheduling, deadlines, and the versioned native consumer ABI.
-Linux::Event::Async owns coroutine-facing suspension state,
-Future::AsyncAwait integration, cancellation semantics, async-sub result
-Futures, and operation adapters over Linux::Event resources.
+monotonic timer scheduling, pidfd process lifecycle, asynchronous process pipes,
+and the versioned native consumer ABI. Linux::Event::Async owns
+coroutine-facing suspension state, Future::AsyncAwait integration, cancellation
+semantics, async-sub result Futures, and operation adapters over Linux::Event
+resources.
 
 The dependency direction is intentionally one way:
 
@@ -157,6 +159,23 @@ in one scalar rather than an unbounded queue. Cancelling a pending Timer wait
 cancels only that suspension; the underlying recurring Timer continues until
 its normal C<cancel> is called.
 
+=head1 PROCESS MODEL
+
+L<Linux::Event::Async::Process> adapts the public pidfd-backed
+L<Linux::Event::Kernel::Process> lifecycle. C<< await $process->wait >> resolves
+with the same Process after normal core exit completion.
+
+Core reaps the pid and drains remaining stdout/stderr pipe data before the
+reserved C<on_exit> bridge runs, so Process status fields and final output
+callbacks are settled before the Future resumes. Multiple callers may wait for
+the same exit. Cancelling one wait is waiter-local and never sends a signal or
+terminates the child.
+
+Version 0.002 intentionally leaves stdout/stderr delivery on the core callback
+path and retains C<write_stdin>, C<close_stdin>, and stdin backpressure as core
+operations. It does not impose a partially specified pull-buffering model on
+Process pipe I/O merely to add an C<await> spelling.
+
 =head1 DRIVING ASYNC WORK
 
 Calling an C<async sub> starts it immediately and returns a
@@ -200,18 +219,24 @@ persistent packet C<recv>;
 =item *
 
 L<Linux::Event::Async::Timer> persistent C<wait> with coalesced expiration
-counts.
+counts;
+
+=item *
+
+L<Linux::Event::Async::Process> Future-based process completion C<wait> after
+pidfd reaping and final stdout/stderr drain.
 
 =back
 
-Process completion, signals, eventfd events, pipe/TTY operations, resolver
-operations, and generic fd readiness remain future extensions rather than
-hidden 0.002 APIs.
+Signals, eventfd events, pull-style process pipe operations, Pipe/TTY operations,
+resolver operations, and generic fd readiness remain future extensions rather
+than hidden 0.002 APIs.
 
 =head1 SEE ALSO
 
 L<Linux::Event::Async::Listener>, L<Linux::Event::Async::Stream>,
 L<Linux::Event::Async::Dgram>, L<Linux::Event::Async::Timer>,
-L<Linux::Event::Async::Future>, L<Linux::Event>, L<Future::AsyncAwait>
+L<Linux::Event::Async::Process>, L<Linux::Event::Async::Future>,
+L<Linux::Event>, L<Future::AsyncAwait>
 
 =cut
