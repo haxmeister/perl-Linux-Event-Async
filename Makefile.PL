@@ -14,6 +14,7 @@ my @public_modules = qw(
     Linux::Event::Async::Stream
     Linux::Event::Async::Listener
     Linux::Event::Async::Timer
+    Linux::Event::Async::Dgram
 );
 
 my $distribution_version = MM->parse_version('lib/Linux/Event/Async.pm');
@@ -58,6 +59,7 @@ WriteMakefile(
                 Linux::Event::Async::Stream::Awaitable
                 Linux::Event::Async::Listener::Awaitable
                 Linux::Event::Async::Timer::Awaitable
+                Linux::Event::Async::Dgram::Awaitable
             )],
         },
         provides => \%provides,
