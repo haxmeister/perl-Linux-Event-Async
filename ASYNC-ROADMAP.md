@@ -2,14 +2,16 @@
 
 ## Current status
 
-Linux::Event::Async 0.001 is the first stable release target.
+Linux::Event::Async 0.002 is the first stable release target. The earlier
+0.001_001 version was a developer release, so 0.002 is the next valid stable
+version in Perl version ordering.
 
 The architectural prerequisite that originally blocked this distribution is no
 longer pending. Linux::Event 0.110 ships the public versioned ordered-byte
 consumer ABI and the public `Linux::Event::IO::Sock::Stream` hierarchy used by
 Linux::Event::Async.
 
-The implemented 0.001 surface is intentionally narrow:
+The implemented 0.002 surface is intentionally narrow:
 
 - Future::AsyncAwait integration;
 - `Linux::Event::Async::Future` for `async sub` results;
@@ -19,7 +21,7 @@ The implemented 0.001 surface is intentionally narrow:
 - bounded native prefetch for consecutive receives.
 
 The old implementation staging plan is complete. This document now records the
-constraints that must remain true and the direction for work after 0.001.
+constraints that must remain true and the direction for work after 0.002.
 
 ## Architectural boundary
 
@@ -171,8 +173,8 @@ dispatches so sequential awaits may move between Loops.
 
 ## Performance invariants
 
-The first release established several design constraints that should not be
-casually traded away:
+The first stable release establishes several design constraints that should not
+be casually traded away:
 
 1. No per-message Future allocation on Stream receive.
 2. No per-message Awaitable allocation on Stream receive.
@@ -189,9 +191,9 @@ Benchmark results are evidence for these choices, not API guarantees. Changes to
 the receive path should be evaluated with the repository benchmark harnesses on
 multiple payload sizes and should always be paired with correctness tests.
 
-## 0.001 release gates
+## 0.002 release gates
 
-A 0.001 release candidate should satisfy all of the following:
+A 0.002 release candidate should satisfy all of the following:
 
 - Linux::Event minimum dependency is a released version containing consumer ABI
   v1; currently 0.110;
@@ -208,7 +210,7 @@ A 0.001 release candidate should satisfy all of the following:
 - POD, README, Changes, LICENSE, and metadata describe the released architecture
   rather than an unreleased development branch.
 
-## Work after 0.001
+## Work after 0.002
 
 The next useful layer is not a new event loop abstraction. It is a small set of
 awaitable operations over capabilities Linux::Event already owns.
@@ -237,7 +239,7 @@ Each operation should answer the same questions before becoming public:
 ## Deferred higher-level work
 
 Structured concurrency, task groups, cancellation scopes, protocol-specific
-clients, HTTP, WebSocket, and application frameworks belong above the 0.001
+clients, HTTP, WebSocket, and application frameworks belong above the 0.002
 primitive layer.
 
 They may eventually use Linux::Event::Async, but they should not force Future or
