@@ -5,7 +5,7 @@ use warnings;
 
 use parent 'Linux::Event::IO::Sock::Stream';
 use Carp qw(croak);
-use Scalar::Util qw(weaken);
+use Scalar::Util qw(refaddr weaken);
 use Linux::Event::Async::Future ();
 use Linux::Event::Error ();
 use Linux::Event::Framer ();
@@ -24,7 +24,18 @@ Linux::Event::Framer->declare_native_consumer(
     },
 );
 
+sub _owns_drain_callback ($class) {
+    my $actual = $class->can('on_drain');
+    my $owned = __PACKAGE__->can('on_drain');
+    return $actual && $owned && refaddr($actual) == refaddr($owned);
+}
+
 sub new ($class, %option) {
+    croak "$class must not override on_drain(); await drain() is the backpressure sink"
+        if !_owns_drain_callback($class);
+    croak 'new(): on_drain is reserved by Linux::Event::Async::Stream; use await drain()'
+        if exists $option{on_drain};
+
     my $accepted = $option{_accepted} // 0;
     my $self = $class->SUPER::new(%option);
 
@@ -132,29 +143,14 @@ sub _fire_ready ($self) {
     return;
 }
 
-sub _xs_drain ($self) {
-    return $self->SUPER::_xs_drain if $self->is_closed;
-
-    # Core may report a preconnect low-water transition before application
-    # readiness, but deliberately defers on_drain until the connection becomes
-    # usable. Match that behavior rather than completing an Async drain early.
-    my $deferred = $self->{preconnect_write_blocked}
-        && !(($self->{transport_ready_fired} // 0) & 0x02);
-
-    # Once a real drain transition has occurred, detach its waiters before the
-    # user on_drain callback runs. A reentrant close or a new write that blocks
-    # again cannot retroactively turn the completed transition into failure.
-    my $waiters = $deferred
-        ? [] : delete($self->{_async_drain_waiters}) // [];
-
-    my $core_failure;
-    my $ok = eval { $self->SUPER::_xs_drain; 1 };
-    $core_failure = $@ if !$ok;
-
-    my $future_failure
-        = $self->_finish_waiter_list($waiters, 'done', $self);
-    die $core_failure if defined($core_failure) && length($core_failure);
-    die $future_failure if defined($future_failure) && length($future_failure);
+sub on_drain ($self) {
+    # Core owns the exact blocked->low-watermark transition and already defers
+    # preconnect drain notification until application readiness. This reserved
+    # callback is therefore the stable bridge for the Async drain operation on
+    # both Linux::Event 0.110 and current core.
+    my $waiters = delete $self->{_async_drain_waiters} // [];
+    my $failure = $self->_finish_waiter_list($waiters, 'done', $self);
+    die $failure if defined($failure) && length($failure);
     return;
 }
 
@@ -396,21 +392,21 @@ C<drain> observes Linux::Event's cooperative backpressure transition; it does
 not promise that C<pending_bytes> is zero. Code that merely needs permission to
 produce more output should wait for C<drain>, not busy-wait for an empty queue.
 
-The core C<on_drain($stream)> lifecycle callback remains supported and runs
-before drain Future waiters resume. The drain transition is recorded before the
-callback runs, so a callback that closes the Stream or immediately writes enough
-data to become blocked again does not retroactively fail waiters for the drain
-that already occurred.
+C<on_drain> is reserved by C<Linux::Event::Async::Stream> as the bridge from the
+core blocked-to-low-watermark transition to pending drain Futures. Concrete
+Async Stream subclasses must not override C<on_drain>, and the constructor
+C<on_drain> callback form is not accepted. Application backpressure handling
+belongs around C<< await $stream->drain >>.
 
 Multiple Futures may wait on one blocked period. Cancelling one drain Future
 cancels only that wait; it neither closes the Stream nor discards queued output.
 A Stream error or explicit close before the blocked period drains fails pending
 waiters with the Stream's L<Linux::Event::Error> or an C<event>/C<drain> error.
 
-Preconnect backpressure preserves core ordering: if writes cross the high
-watermark before an outbound connection becomes application-ready, C<drain>
-does not complete on an internal preconnect low-water transition. It completes
-only when Linux::Event exposes the normal post-readiness drain transition.
+Preconnect backpressure preserves core ordering automatically: Linux::Event
+does not invoke the reserved C<on_drain> bridge until the connection becomes
+application-ready, even when queued output crossed the high watermark before
+connect completed.
 
 A blocked Stream must be attached to a Loop before C<drain> can create a pending
 wait. An unblocked Stream may return an immediately completed drain Future even
@@ -462,9 +458,9 @@ class. A concrete Async Stream subclass must not define C<on_message> or
 C<on_messages>, and C<message_batch_size> must remain disabled. Linux::Event
 rejects those combinations when building the class descriptor.
 
-Lifecycle callbacks such as C<on_ready>, C<on_drain>, C<on_eof>, C<on_error>,
-and C<on_close> remain available through the underlying Stream API; this
-restriction applies only to framed message delivery.
+C<on_drain> is also reserved by the Async drain operation. Other lifecycle
+callbacks such as C<on_ready>, C<on_eof>, C<on_error>, and C<on_close> remain
+available through the underlying Stream API.
 
 =head1 OUTPUT
 
