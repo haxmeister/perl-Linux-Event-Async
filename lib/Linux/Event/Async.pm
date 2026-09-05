@@ -3,7 +3,7 @@ use v5.36;
 use strict;
 use warnings;
 
-our $VERSION = '0.001';
+our $VERSION = '0.002';
 
 use Future::AsyncAwait 0.71 ();
 use Linux::Event::Async::Future ();
@@ -104,10 +104,10 @@ newer, and Future::AsyncAwait 0.71 or newer.
 
 =head1 FIRST RELEASE SCOPE
 
-Version 0.001 provides the async-sub Future implementation and framed
+Version 0.002 provides the async-sub Future implementation and framed
 C<SOCK_STREAM> receive path. Additional awaitable operations such as accept,
 drain, timers, process completion, and resolver work are future extensions and
-are not part of the 0.001 API contract.
+are not part of the 0.002 API contract.
 
 =head1 SEE ALSO
 
