@@ -9,6 +9,7 @@ use Future::AsyncAwait 0.71 ();
 use Linux::Event::Async::Future ();
 use Linux::Event::Async::Stream ();
 use Linux::Event::Async::Listener ();
+use Linux::Event::Async::Timer ();
 
 sub import {
     @_ = ('Future::AsyncAwait', future_class => 'Linux::Event::Async::Future');
@@ -46,7 +47,8 @@ Linux::Event::Async - async/await integration for Linux::Event
           my $stream = await $listener->accept;
           await $stream->ready;
           while (defined(my $message = await $stream->recv)) {
-              say $message;
+              $stream->send($message);
+              await $stream->drain if $stream->is_write_blocked;
           }
       }
   }
@@ -64,20 +66,21 @@ Importing this module installs C<async> and C<await> through
 L<Future::AsyncAwait> and selects L<Linux::Event::Async::Future> as the Future
 class used for C<async sub> results.
 
-The first stable release covers three suspension patterns. Application readiness
-is a cold one-shot lifecycle operation and C<< $stream->ready >> returns an
-ordinary L<Linux::Event::Async::Future>. Framed Stream receive and Listener
-accept are hot repeated operations and use persistent per-resource Awaitable
-views, avoiding one Future or Awaitable allocation for each message or accepted
-connection.
+Version 0.002 deliberately uses two suspension models. Cold lifecycle or
+backpressure transitions such as Stream C<ready> and C<drain> return ordinary
+L<Linux::Event::Async::Future> objects. Hot repeated operations such as framed
+Stream C<recv>, Listener C<accept>, and Timer C<wait> use persistent
+per-resource Awaitables so steady-state loops avoid one Future or Awaitable
+allocation per event.
 
 =head1 ARCHITECTURE
 
 Linux::Event continues to own epoll dispatch, socket lifecycle, bind/listen and
-accept4, TLS, framing, buffering, backpressure, fairness, deadlines, and the
-versioned native consumer ABI. Linux::Event::Async owns coroutine-facing
-suspension state, Future::AsyncAwait integration, cancellation semantics,
-async-sub result Futures, and operation adapters over Linux::Event resources.
+accept4, TLS, framing, buffering, backpressure, fairness, monotonic timer
+scheduling, deadlines, and the versioned native consumer ABI.
+Linux::Event::Async owns coroutine-facing suspension state,
+Future::AsyncAwait integration, cancellation semantics, async-sub result
+Futures, and operation adapters over Linux::Event resources.
 
 The dependency direction is intentionally one way:
 
@@ -91,20 +94,21 @@ Linux::Event does not depend on this distribution.
 Applications normally define a protocol class derived from
 L<Linux::Event::Async::Stream> and declare one of Linux::Event's built-in native
 framers with L<Linux::Event::Framer>. That subclass retains the normal
-Linux::Event stream policy surface, including C<stream_options>, socket policy,
+Linux::Event Stream policy surface, including C<stream_options>, socket policy,
 and declarative L<Linux::Event::TLS> configuration.
 
-For an outbound or accepted connection, C<< await $stream->ready >> waits until
-the Stream is application-ready. For TLS that means after handshake and
-verification, not merely after TCP connection. The normal C<on_ready> lifecycle
-callback remains available and runs before readiness Future waiters resume.
+C<< await $stream->ready >> waits for application readiness. For TLS that means
+after handshake and verification, not merely after TCP connection.
+C<< await $stream->recv >> receives one framed message through the persistent
+native receive Awaitable. C<< await $stream->drain >> waits for an active
+high-water backpressure period to clear through the configured low watermark.
 
 Only one receive may be pending on a Stream. Clean EOF resolves to C<undef>.
-Cancelling a pending receive does not close the Stream and does not consume the
-next message. I/O, framing, and lifecycle failures are delivered as the typed
-errors supplied by Linux::Event.
+Cancelling a receive does not close the Stream and does not consume the next
+message. Stream lifecycle failures are delivered as the typed errors supplied
+by Linux::Event.
 
-See L<Linux::Event::Async::Stream> for the complete readiness, receive,
+See L<Linux::Event::Async::Stream> for the complete readiness, drain, receive,
 cancellation, framing, TLS, and tuning contract.
 
 =head1 LISTENER MODEL
@@ -114,13 +118,27 @@ returns the exact C<stream_class> object constructed by the Linux::Event core.
 One persistent Listener Awaitable is reused across an accept loop.
 
 The Async Listener is pull-based: acceptance is paused while no accept is
-pending, and cancellation pauses rather than closes the listening socket. For
-the first stable implementation it uses one level-triggered kernel accept per
-armed wait so additional connections remain in the kernel backlog rather than
-being accepted and discarded behind a completed Awaitable.
+pending, and cancellation pauses rather than closes the listening socket. The
+0.002 implementation uses one level-triggered kernel accept per armed wait so
+additional connections remain in the kernel backlog instead of being accepted
+and discarded behind a completed Awaitable.
 
 Use an L<Linux::Event::Async::Stream> subclass as C<stream_class> for a complete
-coroutine path from accept through application readiness and framed receive.
+coroutine path from accept through application readiness, framed receive, and
+backpressured output.
+
+=head1 TIMER MODEL
+
+L<Linux::Event::Async::Timer> adapts the public monotonic
+L<Linux::Event::Kernel::Timer> scheduler. C<< await $timer->wait >> returns the
+number of expirations represented by that timer event and reuses one persistent
+Awaitable across recurring waits.
+
+Recurring timers retain Linux::Event's fixed-rate and coalescing semantics. If
+expirations occur while no wait is armed, the represented count is accumulated
+in one scalar rather than an unbounded queue. Cancelling a pending Timer wait
+cancels only that suspension; the underlying recurring Timer continues until
+its normal C<cancel> is called.
 
 =head1 DRIVING ASYNC WORK
 
@@ -140,16 +158,38 @@ newer, and Future::AsyncAwait 0.71 or newer.
 
 =head1 FIRST RELEASE SCOPE
 
-Version 0.002 provides the async-sub Future implementation, awaitable Stream
-application readiness, persistent Listener C<accept>, and framed C<SOCK_STREAM>
-receive. Additional awaitable operations such as output drain, timers,
-datagrams, process completion, signals, eventfd events, pipe/TTY operations,
-resolver operations, and generic fd readiness are future extensions and are not
-part of the 0.002 API contract.
+Version 0.002 provides:
+
+=over 4
+
+=item *
+
+L<Linux::Event::Async::Future> for C<async sub> results and cold one-shot waits;
+
+=item *
+
+L<Linux::Event::Async::Stream> application C<ready>, output C<drain>, and
+persistent framed C<recv>;
+
+=item *
+
+L<Linux::Event::Async::Listener> persistent C<accept>;
+
+=item *
+
+L<Linux::Event::Async::Timer> persistent C<wait> with coalesced expiration
+counts.
+
+=back
+
+Datagram operations, process completion, signals, eventfd events, pipe/TTY
+operations, resolver operations, and generic fd readiness remain future
+extensions rather than hidden 0.002 APIs.
 
 =head1 SEE ALSO
 
 L<Linux::Event::Async::Listener>, L<Linux::Event::Async::Stream>,
-L<Linux::Event::Async::Future>, L<Linux::Event>, L<Future::AsyncAwait>
+L<Linux::Event::Async::Timer>, L<Linux::Event::Async::Future>,
+L<Linux::Event>, L<Future::AsyncAwait>
 
 =cut
