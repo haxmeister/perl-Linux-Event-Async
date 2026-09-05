@@ -1,20 +1,45 @@
 Revision history for Linux-Event-Async
 
-    - Add deterministic stress coverage for many concurrent tasks, shuffled
-      readiness, mixed failures and cancellations, stale completed Futures,
-      nested cancellation, and closing Streams with pending receives.
-
+0.001  2026-09-05
+    - First stable release.
+    - Require Linux::Event 0.110 and use its public
+      Linux::Event::IO::Sock::Stream and Linux::Event::Framer native-consumer
+      extension boundary rather than the historical Stream implementation
+      package.
+    - Synchronize the vendored ordered-byte consumer ABI v1 header with the
+      released Linux::Event contract, including read-side terminal events and
+      host retain/release lifetime operations.
+    - Guard callback-capable consumer host resume and pause calls with the ABI
+      retain/release contract so reentrant cancellation callbacks or resumed
+      coroutines may close and destroy the Stream safely.
+    - Add deterministic regression coverage for reentrant Stream close from a
+      receive cancellation callback.
+    - Return one persistent native Awaitable view from Stream recv, avoiding one
+      Future or Awaitable allocation per received message.
+    - Keep receive arming in XS and use a bounded 64-message, approximately
+      256 KiB prefetch ring. Consecutive receives can consume retained messages
+      immediately while bounded pause and backpressure remain intact.
     - Add concurrency regression coverage for multiple async subs sharing one
       Loop, out-of-order completion, isolated failure and cancellation, and the
       single-reader-per-Stream contract.
     - Follow the currently awaited Linux::Event Loop when an async sub composes
       sequential operations across different Loops, including through nested
-      child async subs, preventing AWAIT_WAIT from remaining blocked on an
-      earlier Loop.
-    - Make native consumer teardown safe when Perl global destruction has
-      already invalidated the persistent Stream Awaitable referent.
-    - Document that Loop run continues until stop and does not infer completion
-      from async-sub Futures.
+      child async subs, so AWAIT_WAIT does not remain blocked on an earlier
+      Loop.
+    - Make native consumer teardown safe during Perl global destruction.
+    - Add deterministic stress coverage for many concurrent tasks, shuffled
+      readiness, mixed failures and cancellations, stale completed Futures,
+      nested cancellation, and closing Streams with pending receives.
+    - Run release CI against the minimum supported Linux::Event 0.110 on Perl
+      5.36 and 5.44 with make test and make disttest, plus a separate integration
+      lane against current Linux::Event main.
+    - Declare the Test2::V0 dependency required by the Future::AsyncAwait
+      alternative-Awaitable conformance suite.
+    - Add explicit CPAN provides/no_index metadata, repository resources, a
+      Linux-only configure guard, and the Perl 5 license.
+    - Rewrite public POD, README, and roadmap for the released architecture,
+      including subclass framing/TLS policy, all Async-applicable stream tuning
+      options, receive cancellation, bounded prefetch, and first-release scope.
 
 0.001_001  2026-08-30
     - Initial development skeleton for the separate Linux::Event::Async
