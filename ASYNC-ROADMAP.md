@@ -8,8 +8,8 @@ version in Perl version ordering.
 
 Linux::Event 0.110 supplies the released public resource hierarchy and the
 versioned ordered-byte consumer ABI required by this distribution. Async 0.002
-now covers the first useful coroutine path from connection acceptance through
-framed I/O and monotonic timing:
+now covers the first useful coroutine paths across stream sockets, datagram
+sockets, listeners, and monotonic timing:
 
 - Future::AsyncAwait integration;
 - `Linux::Event::Async::Future` for `async sub` results and cold waits;
@@ -17,18 +17,20 @@ framed I/O and monotonic timing:
 - Stream output `drain` at the normal backpressure low-water transition;
 - one persistent native Stream Awaitable for framed `recv`;
 - `Linux::Event::Async::Listener` with persistent pull-based `accept`;
+- `Linux::Event::Async::Dgram` with Future-based `ready`/`drain` and persistent
+  pull-based packet `recv`;
 - `Linux::Event::Async::Timer` with persistent `wait` and coalesced expiration
   counts;
-- wait-local cancellation for receive, accept, and Timer waits;
+- wait-local cancellation for repeated pull operations;
 - bounded native Stream prefetch; and
 - reentrant close/lifetime safety across the consumer ABI.
 
 ## Architectural boundary
 
 Linux::Event remains a callback-first reactor. It owns epoll dispatch, resource
-lifecycle, socket acquisition, accept4, native framing, TLS, ordered-byte I/O,
-backpressure, monotonic timer scheduling, process/kernel resources, and the
-versioned native consumer ABI.
+lifecycle, socket acquisition, accept4, recvmsg/sendmsg, native framing, TLS,
+ordered-byte I/O, packet I/O, backpressure, monotonic timer scheduling,
+process/kernel resources, and the versioned native consumer ABI.
 
 Linux::Event::Async owns Future::AsyncAwait integration, coroutine-facing
 operation state, cancellation propagation, async-sub result Futures, persistent
@@ -64,11 +66,14 @@ Current examples:
 cold / one-shot
     Stream ready
     Stream drain
+    Dgram ready
+    Dgram drain
         -> Linux::Event::Async::Future
 
 hot / repeated
     Stream recv
     Listener accept
+    Dgram recv
     Timer wait
         -> persistent per-resource Awaitable
 ```
@@ -149,6 +154,57 @@ A future native accept provider may add bounded prefetch only if benchmarking
 shows that one accept per readiness turn materially limits realistic server
 workloads.
 
+## Datagram model
+
+`Linux::Event::Async::Dgram` adapts `Linux::Event::IO::Sock::Dgram` without
+turning packets into byte streams.
+
+`ready` and `drain` are cold Future waits. `recv` is a repeated operation and
+uses one persistent Awaitable per Datagram socket:
+
+```perl
+my ($payload, $peer) = await $socket->recv;
+```
+
+List context returns payload and `Linux::Event::Address`; scalar context returns
+the payload. Packet boundaries and peer identity remain core semantics.
+
+### Pull receive and kernel backlog
+
+Linux::Event normally allows multiple `recvmsg` operations per readiness turn.
+A pull-style Awaitable cannot safely resume for packet one after core has already
+removed packets two through N from the kernel queue unless Async also owns a
+bounded packet-prefetch structure.
+
+Version 0.002 chooses the simpler correctness boundary:
+
+- `max_datagrams_per_tick => 1`;
+- `edge_triggered => 0`;
+- read interest paused when no `recv` is armed; and
+- read interest re-enabled only for an explicit pending receive.
+
+Additional packets therefore remain in the kernel receive queue. This mirrors
+the Listener policy of leaving excess connections in the kernel backlog rather
+than constructing an unbounded user-space queue.
+
+A future native Datagram provider may add bounded packet prefetch only if
+benchmarking demonstrates a meaningful throughput limitation.
+
+### Datagram cancellation and output
+
+Receive cancellation is wait-local: it pauses read interest, leaves the socket
+active, and does not consume the next packet. Oversized packets and receive I/O
+errors fail the pending wait after normal subclass `on_error` notification.
+
+`send` remains the core atomic datagram operation. Async observes a false send
+return as the beginning of high-water backpressure. `drain` resolves when the
+blocked period crosses the configured low watermark; it does not promise an
+empty packet queue. Drain cancellation affects only that waiter.
+
+`on_datagram` and `on_drain` are reserved by Async Dgram as its operation
+bridges. Subclass `on_ready`, `on_error`, `on_close`, `configure_socket`, and
+`datagram_options` remain application policy.
+
 ## Timer model
 
 `Linux::Event::Async::Timer` subclasses the public
@@ -188,15 +244,17 @@ The stable design should preserve these constraints:
 
 1. No per-message Future or Awaitable allocation on Stream receive.
 2. No per-accept Future or Awaitable allocation on Listener accept.
-3. No per-tick Future or Awaitable allocation on recurring Timer wait.
-4. Cold waits do not gain specialized persistent state without measurement.
-5. Native framing remains in Linux::Event.
-6. Stream framing, TLS, socket policy, and tuning remain class policy.
-7. Async buffering and prefetch remain bounded.
-8. Pull-style resources must not silently discard events accepted behind a
-   completed Awaitable.
-9. Lifecycle correctness under cancellation, close, EOF, failure, reentrancy,
-   and destruction takes precedence over speculative batching wins.
+3. No per-packet Future or Awaitable allocation on Datagram receive.
+4. No per-tick Future or Awaitable allocation on recurring Timer wait.
+5. Cold waits do not gain specialized persistent state without measurement.
+6. Native framing remains in Linux::Event.
+7. Stream framing, TLS, socket policy, and tuning remain class policy.
+8. Datagram packet boundaries and socket policy remain core behavior.
+9. Async buffering and prefetch remain bounded.
+10. Pull-style resources must not silently discard events removed behind a
+    completed Awaitable.
+11. Lifecycle correctness under cancellation, close, EOF, failure, reentrancy,
+    and destruction takes precedence over speculative batching wins.
 
 Benchmark changes to hot paths must be paired with correctness tests.
 
@@ -214,6 +272,9 @@ The 0.002 candidate should satisfy all of the following:
   global destruction, and stress tests pass;
 - Listener accept covers repeated acceptance, cancellation/retry, close/error,
   backlog preservation, and Async Stream handoff;
+- Datagram covers readiness, repeated ordered receive, kernel-queue preservation,
+  cancellation/retry, oversized-packet error routing, close, real output
+  backpressure, and drain cancellation;
 - Timer covers one-shot, recurring, coalesced expirations, reschedule,
   wait-local cancellation, underlying Timer cancellation, and reentrant terminal
   waits;
@@ -225,13 +286,12 @@ The 0.002 candidate should satisfy all of the following:
 
 The next candidate capabilities are:
 
-1. datagram receive and output suspension;
-2. process completion and process pipe I/O;
-3. signal delivery;
-4. eventfd events;
-5. Pipe and TTY input/output suspension points;
-6. resolver completion where a standalone operation is useful; and
-7. generic fd readable/writable readiness as a low-level escape hatch.
+1. process completion and process pipe I/O;
+2. signal delivery;
+3. eventfd events;
+4. Pipe and TTY input/output suspension points;
+5. resolver completion where a standalone operation is useful; and
+6. generic fd readable/writable readiness as a low-level escape hatch.
 
 For each operation decide before implementation:
 
