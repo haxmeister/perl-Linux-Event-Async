@@ -223,12 +223,36 @@ leaf_stream_awaitable_loop(pTHX_ SV *target)
     return loop;
 }
 
+static SV *
+leaf_operation_awaitable_loop(pTHX_ SV *target)
+{
+    dSP;
+    SV *returned;
+    SV *loop = NULL;
+
+    ENTER;
+    SAVETMPS;
+    PUSHMARK(SP);
+    PUSHs(target);
+    PUTBACK;
+    call_method("AWAIT_LOOP", G_SCALAR);
+    SPAGAIN;
+    returned = POPs;
+    if (SvOK(returned))
+        loop = newSVsv(returned);
+    PUTBACK;
+    FREETMPS;
+    LEAVE;
+    return loop;
+}
+
 static SV *leaf_effective_loop(pTHX_ leaf_future_t *future, unsigned int depth);
 
 static SV *
 leaf_target_loop(pTHX_ SV *target, unsigned int depth)
 {
     leaf_future_t *target_future;
+    HV *stash;
 
     if (sv_derived_from(target, "Linux::Event::Async::Future")) {
         target_future = leaf_from_sv(target);
@@ -237,6 +261,11 @@ leaf_target_loop(pTHX_ SV *target, unsigned int depth)
     if (sv_derived_from(target,
             "Linux::Event::Async::Stream::Awaitable"))
         return leaf_stream_awaitable_loop(aTHX_ target);
+    if (sv_isobject(target) && SvROK(target)) {
+        stash = SvSTASH(SvRV(target));
+        if (stash && gv_fetchmethod_autoload(stash, "AWAIT_LOOP", 0))
+            return leaf_operation_awaitable_loop(aTHX_ target);
+    }
     return NULL;
 }
 
