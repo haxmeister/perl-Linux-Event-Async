@@ -11,44 +11,25 @@ Revision history for Linux-Event-Async
     - Preserve normal core on_ready behavior alongside ready(): on_ready runs
       first, multiple Future waiters may observe the same one-shot readiness
       transition, and cancelling one readiness wait does not close the Stream.
-    - Propagate connection, resolver, transport, TLS, timeout, and setup failures
-      through pending readiness Futures using the Stream's Linux::Event::Error;
-      explicitly closing before readiness produces an event/ready error.
     - Add Stream drain(), returning a Future that waits for an active
-      high-water backpressure period to clear through the configured low
-      watermark. It resolves at the normal Linux::Event drain transition rather
-      than requiring pending_bytes to reach zero.
-    - Reserve the Async Stream on_drain bridge so core callback dispatch and
-      Future completion share one supported boundary. Drain Future cancellation
-      is waiter-local and close/error fails pending drain waiters.
-    - Add Linux::Event::Async::Listener with persistent awaitable accept().
-      Acceptance is pull-based and paused while no wait is armed; cancelling an
-      accept wait does not close the Listener.
-    - Use one level-triggered kernel accept per armed Async Listener wait in
-      0.002 so additional connections remain in the kernel backlog instead of
-      being accepted behind an already completed Awaitable.
+      high-water backpressure period to cross the configured low watermark.
+      It does not require pending_bytes to reach zero.
+    - Add Linux::Event::Async::Listener with persistent pull-based accept().
+      Acceptance pauses while no wait is armed and uses one level-triggered
+      accept per armed wait so excess connections remain in the kernel backlog.
     - Add Linux::Event::Async::Dgram with Future-based ready()/drain() and one
       persistent Awaitable for repeated packet recv(). List context returns
       payload plus Linux::Event::Address; scalar context returns payload.
     - Make Async Datagram receive pull-based by fixing
-      max_datagrams_per_tick => 1 and edge_triggered => 0. This prevents core
-      recv batching from removing packets behind an already completed Awaitable;
-      additional packets stay in the kernel receive queue until the next recv().
-    - Preserve Datagram atomic send semantics and output watermarks. drain()
-      waits for a high-water blocked period to cross the configured low
-      watermark, while cancellation remains waiter-local.
-    - Route Datagram oversized-packet and I/O failures through pending receives
-      after the normal subclass on_error callback, and cover UDP ordering,
-      cancellation/retry, close, error ordering, and real output backpressure.
-    - Add Linux::Event::Async::Timer with a persistent wait() Awaitable over the
-      public Linux::Event::Kernel::Timer scheduler. Repeated recurring waits do
-      not allocate one Future or Awaitable per tick.
-    - Preserve Timer fixed-rate/coalesced semantics by returning the represented
-      expiration count. Expirations occurring while no wait is armed accumulate
-      in one scalar rather than an unbounded tick queue.
-    - Make Timer wait cancellation wait-local: cancelling the Awaitable or an
-      async sub currently awaiting it leaves the underlying recurring Timer
-      active. Core Timer cancel remains terminal and fails a pending wait.
+      max_datagrams_per_tick => 1 and edge_triggered => 0, leaving additional
+      packets in the kernel receive queue until the next recv().
+    - Preserve Datagram atomic send semantics, queue limits, socket policy, and
+      high/low-water output backpressure. Drain cancellation remains waiter-local.
+    - Add Linux::Event::Async::Timer with one persistent wait() Awaitable over
+      Linux::Event::Kernel::Timer. Recurring waits preserve fixed-rate/coalesced
+      expiration counts without one Future or Awaitable allocation per tick.
+    - Make Timer wait cancellation wait-local. Core Timer cancel remains terminal
+      and fails a pending wait.
     - Add Linux::Event::Async::Process with Future-based wait() over the public
       pidfd Process lifecycle. wait() resolves with the same Process only after
       core has reaped the pid and drained final stdout/stderr pipe data.
@@ -58,41 +39,51 @@ Revision history for Linux-Event-Async
     - Keep Process stdout/stderr on the established callback drain path and keep
       write_stdin/close_stdin as core operations in 0.002 rather than inventing
       an unbounded or batching-ambiguous pull pipe API.
+    - Add Linux::Event::Async::Signal with one persistent wait() Awaitable over
+      the shared signalfd subscription. List context returns signal number plus
+      the aggregated signalfd record count; scalar context returns the number.
+    - Bound idle Signal delivery to at most one pending entry per subscribed
+      signal number, accumulating counts per number instead of building an
+      unbounded notification queue. cancel_wait() is wait-local while core
+      Signal cancel remains terminal.
+    - Add Linux::Event::Async::Event with one persistent wait() Awaitable over
+      eventfd notification. Idle eventfd deliveries accumulate in one scalar;
+      the Event remains notification-only and application payloads stay in the
+      caller's real IPC/data channel.
+    - Preserve Event thread/fork signaling boundaries. Worker interpreter clones
+      may signal through the core handle but do not own Async wait state.
+      cancel_wait() is wait-local while core Event cancel remains terminal.
     - Synchronize the vendored ordered-byte consumer ABI v1 header with the
       released Linux::Event contract, including read-side terminal events and
       host retain/release lifetime operations.
     - Guard callback-capable consumer host resume and pause calls with the ABI
       retain/release contract so reentrant Stream close and destruction are
       safe.
-    - Add deterministic regression coverage for reentrant Stream close from a
-      receive cancellation callback.
     - Return one persistent native Awaitable view from Stream recv, avoiding one
       Future or Awaitable allocation per received message.
     - Keep receive arming in XS and use a bounded 64-message, approximately
       256 KiB prefetch ring. Consecutive receives can consume retained messages
       immediately while bounded pause and backpressure remain intact.
-    - Add regression coverage for Stream readiness and drain, Listener accept,
-      Datagram receive/drain, Timer waits and cancellation, Process completion,
-      final process output drain, multiple async subs sharing one Loop,
-      out-of-order completion, isolated failure/cancellation, global
-      destruction, and stress lifecycles.
     - Follow the currently awaited Linux::Event Loop when an async sub composes
       sequential operations across different Loops, including through nested
-      child async subs, so AWAIT_WAIT does not remain blocked on an earlier
-      Loop.
+      child async subs.
     - Make native consumer teardown safe during Perl global destruction.
-    - Run release CI against the minimum supported Linux::Event 0.110 on Perl
-      5.36 and 5.44 with make test and make disttest, plus a separate integration
-      lane against current Linux::Event main.
+    - Add regression coverage for Stream readiness/drain/receive, Listener
+      acceptance, Datagram receive/drain, Timer waits, Process completion and
+      final pipe drain, Signal delivery/coalescing/cancellation, Event delivery
+      and cancellation, multi-task composition, global destruction, and stress
+      lifecycles.
+    - Run release CI against Linux::Event 0.110 on Perl 5.36 and 5.44 with
+      make test and make disttest, plus a current-core integration lane.
+      Same-repository PR events skip duplicate jobs while fork PRs retain CI.
     - Declare the Test2::V0 dependency required by the Future::AsyncAwait
       alternative-Awaitable conformance suite.
-    - Add explicit CPAN provides/no_index metadata, repository resources, a
-      Linux-only configure guard, and the Perl 5 license.
+    - Add explicit distribution provides/no_index metadata, repository resources,
+      a Linux-only configure guard, and the Perl 5 license.
     - Rewrite public POD, README, and roadmap for the released architecture,
       including subclass framing/TLS policy, Stream/Datagram/Process tuning,
-      readiness, drain, Listener accept, Datagram packet receive, Timer waits,
-      Process completion, cancellation, bounded prefetch, and first-release
-      scope.
+      readiness, backpressure, bounded pull/coalescing behavior, cancellation,
+      and first-release scope.
 
 0.001_001  2026-08-30
     - Initial development skeleton for the separate Linux::Event::Async
