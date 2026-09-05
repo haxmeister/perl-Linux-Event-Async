@@ -49,6 +49,15 @@ Revision history for Linux-Event-Async
     - Make Timer wait cancellation wait-local: cancelling the Awaitable or an
       async sub currently awaiting it leaves the underlying recurring Timer
       active. Core Timer cancel remains terminal and fails a pending wait.
+    - Add Linux::Event::Async::Process with Future-based wait() over the public
+      pidfd Process lifecycle. wait() resolves with the same Process only after
+      core has reaped the pid and drained final stdout/stderr pipe data.
+    - Support multiple Process exit waiters and waiter-local cancellation.
+      Cancelling wait() never sends a signal, kills the child, detaches the
+      Process, or changes explicit application lifecycle policy.
+    - Keep Process stdout/stderr on the established callback drain path and keep
+      write_stdin/close_stdin as core operations in 0.002 rather than inventing
+      an unbounded or batching-ambiguous pull pipe API.
     - Synchronize the vendored ordered-byte consumer ABI v1 header with the
       released Linux::Event contract, including read-side terminal events and
       host retain/release lifetime operations.
@@ -63,9 +72,10 @@ Revision history for Linux-Event-Async
       256 KiB prefetch ring. Consecutive receives can consume retained messages
       immediately while bounded pause and backpressure remain intact.
     - Add regression coverage for Stream readiness and drain, Listener accept,
-      Datagram receive/drain, Timer waits and cancellation, multiple async subs
-      sharing one Loop, out-of-order completion, isolated failure/cancellation,
-      global destruction, and stress lifecycles.
+      Datagram receive/drain, Timer waits and cancellation, Process completion,
+      final process output drain, multiple async subs sharing one Loop,
+      out-of-order completion, isolated failure/cancellation, global
+      destruction, and stress lifecycles.
     - Follow the currently awaited Linux::Event Loop when an async sub composes
       sequential operations across different Loops, including through nested
       child async subs, so AWAIT_WAIT does not remain blocked on an earlier
@@ -79,9 +89,10 @@ Revision history for Linux-Event-Async
     - Add explicit CPAN provides/no_index metadata, repository resources, a
       Linux-only configure guard, and the Perl 5 license.
     - Rewrite public POD, README, and roadmap for the released architecture,
-      including subclass framing/TLS policy, Stream and Datagram tuning,
+      including subclass framing/TLS policy, Stream/Datagram/Process tuning,
       readiness, drain, Listener accept, Datagram packet receive, Timer waits,
-      receive cancellation, bounded prefetch, and first-release scope.
+      Process completion, cancellation, bounded prefetch, and first-release
+      scope.
 
 0.001_001  2026-08-30
     - Initial development skeleton for the separate Linux::Event::Async
