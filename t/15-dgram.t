@@ -16,6 +16,9 @@ use Linux::Event::Async::Dgram;
 
 our @ORDER;
 our @ERRORS;
+our $PHASE = 'initialization';
+$SIG{ALRM} = sub { die "Datagram regression timed out during $PHASE\n" };
+alarm 30;
 
 {
     package T::AsyncDgram;
@@ -73,6 +76,7 @@ sub close_dgram ($socket) {
 }
 
 {
+    $PHASE = 'bound readiness';
     @ORDER = ();
     @ERRORS = ();
     my $loop = Linux::Event::Loop->new;
@@ -104,6 +108,7 @@ sub close_dgram ($socket) {
 }
 
 {
+    $PHASE = 'ordered UDP pull receive';
     @ERRORS = ();
     my $loop = Linux::Event::Loop->new;
     my $server = T::AsyncDgram->new(
@@ -148,6 +153,7 @@ sub close_dgram ($socket) {
 }
 
 {
+    $PHASE = 'receive cancellation';
     my $loop = Linux::Event::Loop->new;
     my $server = T::AsyncDgram->new(
         loop => $loop,
@@ -180,6 +186,7 @@ sub close_dgram ($socket) {
 }
 
 {
+    $PHASE = 'oversized receive error';
     @ORDER = ();
     @ERRORS = ();
     my $loop = Linux::Event::Loop->new;
@@ -214,6 +221,7 @@ sub close_dgram ($socket) {
 }
 
 {
+    $PHASE = 'pre-ready close';
     my $loop = Linux::Event::Loop->new;
     my $server = T::AsyncDgram->new(
         loop => $loop,
@@ -233,6 +241,7 @@ sub close_dgram ($socket) {
 }
 
 {
+    $PHASE = 'Datagram output drain';
     socketpair(my $a, my $b, AF_UNIX, SOCK_DGRAM, PF_UNSPEC)
         or die "socketpair: $!";
     setsockopt($a, SOL_SOCKET, SO_SNDBUF, pack('i', 4096))
@@ -250,7 +259,6 @@ sub close_dgram ($socket) {
         fh   => $a,
     );
 
-    $reader->ready if $reader->can('ready');
     $writer->ready->AWAIT_WAIT;
 
     my $blocked = 0;
@@ -283,6 +291,7 @@ sub close_dgram ($socket) {
 }
 
 {
+    $PHASE = 'construction policy';
     my ($ok, $error) = thrown(sub {
         T::BadAsyncDgram->new(
             host => '127.0.0.1',
@@ -316,4 +325,5 @@ sub close_dgram ($socket) {
         'edge-trigger rejection is explicit');
 }
 
+alarm 0;
 done_testing;
