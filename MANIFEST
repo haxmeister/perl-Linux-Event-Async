@@ -16,6 +16,7 @@ t/02-awaitable.t
 t/10-stream.t
 t/11-stream-ready.t
 t/12-listener.t
+t/13-stream-drain.t
 t/20-concurrency.t
 t/21-global-destruction.t
 t/22-stress.t
