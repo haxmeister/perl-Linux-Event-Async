@@ -8,8 +8,8 @@ version in Perl version ordering.
 
 Linux::Event 0.110 supplies the released public resource hierarchy and the
 versioned ordered-byte consumer ABI required by this distribution. Async 0.002
-now covers the first useful coroutine paths across stream sockets, datagram
-sockets, listeners, and monotonic timing:
+now covers useful coroutine paths across stream sockets, datagram sockets,
+listeners, monotonic timers, and pidfd process completion:
 
 - Future::AsyncAwait integration;
 - `Linux::Event::Async::Future` for `async sub` results and cold waits;
@@ -21,7 +21,8 @@ sockets, listeners, and monotonic timing:
   pull-based packet `recv`;
 - `Linux::Event::Async::Timer` with persistent `wait` and coalesced expiration
   counts;
-- wait-local cancellation for repeated pull operations;
+- `Linux::Event::Async::Process` with Future-based process completion `wait`;
+- wait-local cancellation for coroutine waits;
 - bounded native Stream prefetch; and
 - reentrant close/lifetime safety across the consumer ABI.
 
@@ -29,8 +30,9 @@ sockets, listeners, and monotonic timing:
 
 Linux::Event remains a callback-first reactor. It owns epoll dispatch, resource
 lifecycle, socket acquisition, accept4, recvmsg/sendmsg, native framing, TLS,
-ordered-byte I/O, packet I/O, backpressure, monotonic timer scheduling,
-process/kernel resources, and the versioned native consumer ABI.
+ordered-byte I/O, packet I/O, backpressure, monotonic timer scheduling, pidfd
+process lifecycle, process pipe I/O, kernel resources, and the versioned native
+consumer ABI.
 
 Linux::Event::Async owns Future::AsyncAwait integration, coroutine-facing
 operation state, cancellation propagation, async-sub result Futures, persistent
@@ -68,6 +70,7 @@ cold / one-shot
     Stream drain
     Dgram ready
     Dgram drain
+    Process wait
         -> Linux::Event::Async::Future
 
 hot / repeated
@@ -228,6 +231,39 @@ terminal and fails a pending wait. One-shot final expiration remains consumable
 once; a subsequent wait fails even when attempted reentrantly from the resumed
 continuation.
 
+## Process model
+
+`Linux::Event::Async::Process` subclasses the public
+`Linux::Event::Kernel::Process` and reserves `on_exit` as its completion bridge:
+
+```perl
+await $process->wait;
+```
+
+Process completion is a cold one-shot transition, so every caller receives a
+normal Async Future. Multiple Futures may observe the same exit transition.
+Cancellation is waiter-local and never signals, kills, detaches, or otherwise
+changes Process lifetime.
+
+Core sets the Process to `exited`, reaps pidfd status, and drains remaining
+stdout/stderr bytes before invoking `on_exit`. Therefore wait completion means
+status accessors and final output callbacks are settled.
+
+Version 0.002 deliberately retains stdout/stderr delivery on Linux::Event's
+native callback-drain path. Core may perform multiple successful pipe reads per
+readiness turn according to `max_reads_per_tick`; a pull-style pipe Awaitable
+needs an explicit bounded buffering or one-read fairness contract before Async
+can expose it without silently discarding or unboundedly retaining data.
+
+Likewise, `write_stdin`, `close_stdin`, and `pending_stdin_bytes` remain core
+operations. `on_stdin_drain` is not reserved by Async because core permits that
+callback only when `stdin => 'pipe'`; reserving it on the Async base class would
+incorrectly force every Process to configure piped stdin.
+
+The full `process_options` tuning surface remains class policy, and reusable
+stdout/stderr/EOF/error callbacks may coexist with `wait` on the concrete
+subclass.
+
 ## Future model
 
 `Linux::Event::Async::Future` represents an async computation or cold one-shot
@@ -246,14 +282,16 @@ The stable design should preserve these constraints:
 2. No per-accept Future or Awaitable allocation on Listener accept.
 3. No per-packet Future or Awaitable allocation on Datagram receive.
 4. No per-tick Future or Awaitable allocation on recurring Timer wait.
-5. Cold waits do not gain specialized persistent state without measurement.
+5. Cold waits, including Process exit, do not gain specialized persistent state
+   without measurement.
 6. Native framing remains in Linux::Event.
 7. Stream framing, TLS, socket policy, and tuning remain class policy.
 8. Datagram packet boundaries and socket policy remain core behavior.
-9. Async buffering and prefetch remain bounded.
-10. Pull-style resources must not silently discard events removed behind a
+9. Process reaping, status, signaling, and pipe I/O remain core behavior.
+10. Async buffering and prefetch remain bounded.
+11. Pull-style resources must not silently discard events removed behind a
     completed Awaitable.
-11. Lifecycle correctness under cancellation, close, EOF, failure, reentrancy,
+12. Lifecycle correctness under cancellation, close, EOF, failure, reentrancy,
     and destruction takes precedence over speculative batching wins.
 
 Benchmark changes to hot paths must be paired with correctness tests.
@@ -278,17 +316,22 @@ The 0.002 candidate should satisfy all of the following:
 - Timer covers one-shot, recurring, coalesced expirations, reschedule,
   wait-local cancellation, underlying Timer cancellation, and reentrant terminal
   waits;
+- Process covers normal exit, detached attachment, multiple and cancelled
+  waiters, final stdout/stderr drain ordering, reentrant historical wait, signal
+  termination, and reserved callback policy;
 - `make disttest` includes every public module and regression file;
-- CPAN metadata declares every runtime/test dependency and every public module;
+- distribution metadata declares every runtime/test dependency and every public
+  module; and
 - POD, README, Changes, LICENSE, and metadata describe the actual release tree.
 
 ## Next implementation priorities
 
 The next candidate capabilities are:
 
-1. process completion and process pipe I/O;
-2. signal delivery;
-3. eventfd events;
+1. signal delivery;
+2. eventfd events;
+3. Process stdout/stderr and stdin-drain suspension after a bounded pipe-I/O
+   contract is designed;
 4. Pipe and TTY input/output suspension points;
 5. resolver completion where a standalone operation is useful; and
 6. generic fd readable/writable readiness as a low-level escape hatch.
