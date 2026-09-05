@@ -17,6 +17,7 @@ WriteMakefile(
     },
     TEST_REQUIRES => {
         'Test::More' => 0,
+        'Test2::V0'  => 0,
     },
     XS => {
         'Async.xs' => 'Async.c',
