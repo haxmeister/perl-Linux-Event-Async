@@ -8,7 +8,7 @@ use Carp qw(croak);
 use Linux::Event::Async::Future ();
 use Linux::Event::Framer ();
 
-our $VERSION = '0.001';
+our $VERSION = '0.002';
 
 require XSLoader;
 XSLoader::load('Linux::Event::Async', $VERSION);
