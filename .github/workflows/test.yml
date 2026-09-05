@@ -5,11 +5,12 @@ on:
   pull_request:
 
 concurrency:
-  group: test-${{ github.workflow }}-${{ github.event.pull_request.head.sha || github.sha }}
+  group: test-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: true
 
 jobs:
   release-gate:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -57,6 +58,7 @@ jobs:
           make disttest
 
   core-main-integration:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Check out Linux::Event::Async
