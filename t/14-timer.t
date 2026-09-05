@@ -16,8 +16,7 @@ use Linux::Event::Async::Timer;
     sub on_timer ($timer) { return }
 }
 
-sub thrown (&) {
-    my ($code) = @_;
+sub thrown ($code) {
     my $error;
     my $ok = eval { $code->(); 1 };
     $error = $@ if !$ok;
@@ -44,7 +43,7 @@ sub thrown (&) {
         'Timer reuses one persistent Awaitable');
     ok($terminal->AWAIT_IS_READY,
         'wait after consumed one-shot expiration fails immediately');
-    my ($ok, $error) = thrown { $terminal->AWAIT_GET };
+    my ($ok, $error) = thrown(sub { $terminal->AWAIT_GET });
     ok(!$ok, 'terminal one-shot wait throws');
     isa_ok($error, 'Linux::Event::Error');
     is($error->operation, 'timer_wait',
@@ -55,7 +54,7 @@ sub thrown (&) {
     my $loop = Linux::Event::Loop->new;
     my $timer = Linux::Event::Async::Timer->new(after => 0);
 
-    my ($ok, $error) = thrown { $timer->wait };
+    my ($ok, $error) = thrown(sub { $timer->wait });
     ok(!$ok, 'detached pending Timer cannot be waited');
     like("$error", qr/must be attached to a Linux::Event loop/,
         'detached wait reports attachment requirement');
@@ -133,7 +132,7 @@ sub thrown (&) {
 
     ok($pending->AWAIT_IS_READY,
         'Timer cancellation completes a pending wait');
-    my ($ok, $error) = thrown { $pending->AWAIT_GET };
+    my ($ok, $error) = thrown(sub { $pending->AWAIT_GET });
     ok(!$ok, 'pending wait fails when underlying Timer is cancelled');
     isa_ok($error, 'Linux::Event::Error');
     is($error->operation, 'timer_wait',
@@ -192,7 +191,7 @@ sub thrown (&) {
     }
 
     my $task = wait_twice($timer);
-    my ($ok, $error) = thrown { $task->AWAIT_WAIT };
+    my ($ok, $error) = thrown(sub { $task->AWAIT_WAIT });
     ok(!$ok,
         'one-shot second wait fails even when armed reentrantly from continuation');
     isa_ok($error, 'Linux::Event::Error');
@@ -201,9 +200,9 @@ sub thrown (&) {
 }
 
 {
-    my ($ok, $error) = thrown {
+    my ($ok, $error) = thrown(sub {
         T::BadAsyncTimer->new(after => 0);
-    };
+    });
     ok(!$ok,
         'Async Timer subclass cannot replace reserved on_timer bridge');
     like("$error", qr/must not override on_timer/,
