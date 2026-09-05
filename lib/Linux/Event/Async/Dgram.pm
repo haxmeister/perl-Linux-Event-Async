@@ -538,8 +538,8 @@ Linux::Event::Async::Dgram - awaitable Linux SOCK_DGRAM I/O
       await $socket->ready;
       while (1) {
           my ($payload, $peer) = await $socket->recv;
-          $socket->send($payload, to => $peer);
-          await $socket->drain if !$socket->send('');
+          my $ok = $socket->send($payload, to => $peer);
+          await $socket->drain if defined($ok) && !$ok;
       }
   }
 
@@ -631,11 +631,11 @@ callbacks remain supported and run before the suspended receive resumes.
 
 Connected sockets use:
 
-  $socket->send($payload);
+  my $ok = $socket->send($payload);
 
 Unconnected sockets use:
 
-  $socket->send($payload, to => $peer);
+  my $ok = $socket->send($payload, to => $peer);
 
 One call remains one atomic datagram. The return value retains Linux::Event's
 backpressure meaning. When a send crosses the high watermark it returns false;
