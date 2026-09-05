@@ -6,6 +6,18 @@ Revision history for Linux-Event-Async
       Linux::Event::IO::Sock::Stream and Linux::Event::Framer native-consumer
       extension boundary rather than the historical Stream implementation
       package.
+    - Add Stream ready(), returning a Linux::Event::Async::Future that resolves
+      with the same Stream at application readiness. Outbound readiness covers
+      resolution, connect, and TLS handshake/verification where applicable.
+    - Preserve normal core on_ready behavior alongside ready(): on_ready runs
+      first, multiple Future waiters may observe the same one-shot readiness
+      transition, and cancelling one readiness wait does not close the Stream.
+    - Propagate connection, resolver, transport, TLS, timeout, and setup failures
+      through pending readiness Futures using the Stream's Linux::Event::Error;
+      explicitly closing before readiness produces an event/ready error.
+    - Add readiness regression coverage for adopted sockets, normal outbound
+      connect, cancellation and retry, reentrant close from on_ready, explicit
+      pre-ready close, connection failure, and detached pending Streams.
     - Synchronize the vendored ordered-byte consumer ABI v1 header with the
       released Linux::Event contract, including read-side terminal events and
       host retain/release lifetime operations.
@@ -39,7 +51,8 @@ Revision history for Linux-Event-Async
       Linux-only configure guard, and the Perl 5 license.
     - Rewrite public POD, README, and roadmap for the released architecture,
       including subclass framing/TLS policy, all Async-applicable stream tuning
-      options, receive cancellation, bounded prefetch, and first-release scope.
+      options, application readiness, receive cancellation, bounded prefetch,
+      and first-release scope.
 
 0.001_001  2026-08-30
     - Initial development skeleton for the separate Linux::Event::Async
