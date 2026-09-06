@@ -4,21 +4,67 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
-  perl:
+  release-gate:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        perl-version: ['5.36', '5.44']
     steps:
       - name: Check out Linux::Event::Async
         uses: actions/checkout@v4
         with:
           path: async
 
-      - name: Check out historical Direct Awaitable
+      - name: Check out minimum supported Linux::Event
         uses: actions/checkout@v4
         with:
           repository: haxmeister/perl-linux-event
-          ref: experiment/direct-awaitable
-          path: direct-event
+          ref: v0.110
+          path: linux-event
+
+      - name: Set up Perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl-version }}
+
+      - name: Install build dependencies
+        run: |
+          cpanm --notest Future::AsyncAwait
+          cd linux-event
+          cpanm --notest --installdeps .
+
+      - name: Build and install Linux::Event 0.110
+        run: |
+          cd linux-event
+          perl Makefile.PL
+          make -j2
+          make test
+          make install
+
+      - name: Build, test, and disttest Linux::Event::Async
+        run: |
+          cd async
+          cpanm --notest --installdeps .
+          perl Makefile.PL
+          make -j2
+          make test
+          make disttest
+
+  core-main-integration:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Linux::Event::Async
+        uses: actions/checkout@v4
+        with:
+          path: async
 
       - name: Check out Linux::Event main
         uses: actions/checkout@v4
@@ -30,28 +76,58 @@ jobs:
       - name: Set up Perl
         uses: shogo82148/actions-setup-perl@v1
         with:
-          perl-version: '5.40'
+          perl-version: '5.44'
 
       - name: Install build dependencies
         run: |
           cpanm --notest Future::AsyncAwait
-          cd direct-event
+          cd linux-event
           cpanm --notest --installdeps .
-          cd ../linux-event
-          cpanm --notest --installdeps .
-
-      - name: Build historical Direct Awaitable
-        run: |
-          cd direct-event
-          perl Makefile.PL
-          make -j2
-
-      - name: Benchmark historical Direct Awaitable
-        run: |
-          cd direct-event
-          perl -Mblib ../async/bench/run-direct-awaitable-reference.pl --repeat=7 --warmup=2
 
       - name: Build and install Linux::Event main
+        run: |
+          cd linux-event
+          perl Makefile.PL
+          make -j2
+          make install
+
+      - name: Test Linux::Event::Async against core main
+        run: |
+          cd async
+          cpanm --notest --installdeps .
+          perl Makefile.PL
+          make -j2
+          make test
+
+  threaded-integration:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Linux::Event::Async
+        uses: actions/checkout@v4
+        with:
+          path: async
+
+      - name: Check out minimum supported Linux::Event
+        uses: actions/checkout@v4
+        with:
+          repository: haxmeister/perl-linux-event
+          ref: v0.110
+          path: linux-event
+
+      - name: Set up threaded Perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.44'
+          multi-thread: true
+
+      - name: Install build dependencies
+        run: |
+          cpanm --notest Future::AsyncAwait
+          cd linux-event
+          cpanm --notest --installdeps .
+
+      - name: Build and test threaded Linux::Event 0.110
         run: |
           cd linux-event
           perl Makefile.PL
@@ -59,15 +135,10 @@ jobs:
           make test
           make install
 
-      - name: Build and test Linux::Event::Async
+      - name: Test Linux::Event::Async on threaded Perl
         run: |
           cd async
+          cpanm --notest --installdeps .
           perl Makefile.PL
           make -j2
           make test
-          make disttest
-
-      - name: Benchmark Linux::Event::Async::Stream
-        run: |
-          cd async
-          perl -Mblib bench/run-async-stream-native-bench.pl --repeat=7 --warmup=2

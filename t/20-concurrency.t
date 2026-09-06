@@ -44,6 +44,12 @@ async sub read_one ($stream) {
     return await $stream->recv;
 }
 
+async sub read_two_streams ($first, $second) {
+    my $one = await $first->recv;
+    my $two = await $second->recv;
+    return "$one:$two";
+}
+
 async sub read_then_fail ($stream) {
     await $stream->recv;
     die "intentional task failure\n";
@@ -116,6 +122,36 @@ subtest 'cancelling one task does not cancel another' => sub {
         'second task completes after first task cancellation');
     is(with_timeout(sub { read_one($stream_one)->AWAIT_WAIT }), 'preserved',
         'cancelled task did not consume its Stream message');
+
+    close_pair($stream_one, $peer_one);
+    close_pair($stream_two, $peer_two);
+};
+
+subtest 'cancellation does not reach a reused historical Awaitable' => sub {
+    my $loop = Linux::Event::Loop->new;
+    my ($stream_one, $peer_one) = pair($loop);
+    my ($stream_two, $peer_two) = pair($loop);
+    my $parent = read_two_streams($stream_one, $stream_two);
+
+    syswrite($peer_one, "first\n") == 6 or die "write first: $!";
+    cmp_ok($loop->run_once(100), '>=', 1,
+        'parent consumes first Stream and advances to second');
+    ok(!$parent->is_ready, 'parent is now waiting on second Stream');
+
+    my $unrelated = read_one($stream_one);
+    ok(!$unrelated->is_ready,
+        'historical Stream Awaitable may be rearmed by unrelated work');
+
+    $parent->cancel;
+    ok($parent->is_cancelled, 'parent task is cancelled');
+    ok(!$unrelated->is_cancelled,
+        'parent cancellation does not cancel rearmed historical Stream wait');
+    ok(!$unrelated->is_ready,
+        'rearmed historical Stream wait remains pending after parent cancellation');
+
+    syswrite($peer_one, "preserved\n") == 10 or die "write preserved: $!";
+    is(with_timeout(sub { $unrelated->AWAIT_WAIT }), 'preserved',
+        'rearmed historical Stream wait still receives its message');
 
     close_pair($stream_one, $peer_one);
     close_pair($stream_two, $peer_two);

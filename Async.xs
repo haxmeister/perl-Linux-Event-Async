@@ -154,6 +154,8 @@ lea_error_new(uint32_t event, int error, const char *message)
         text = message && *message ? message : "Stream closed while receive was pending";
     else if (event == LES_CONSUMER_EVENT_DETACHED)
         text = message && *message ? message : "Stream detached while receive was pending";
+    else if (event == LES_CONSUMER_EVENT_READ_CLOSED)
+        text = message && *message ? message : "Stream read side closed while receive was pending";
 
     hv_stores(hv, "type", newSVpv(type, 0));
     hv_stores(hv, "operation", newSVpv(operation, 0));
@@ -217,6 +219,11 @@ lea_consumer_create(pTHX_ const les_consumer_host_api_v1_t *host,
     void *host_context, SV *stream)
 {
     lea_recv_ctx_t *ctx;
+
+    if (!host || host->abi_version != LES_CONSUMER_ABI_VERSION
+        || host->struct_size < LES_CONSUMER_HOST_V1_RETAIN_REQUIRED_SIZE
+        || !host->retain || !host->release)
+        return NULL;
 
     Newxz(ctx, 1, lea_recv_ctx_t);
     if (!ctx)
@@ -339,11 +346,16 @@ static const les_consumer_ops_v1_t lea_consumer_ops = {
 };
 
 static lea_recv_ctx_t *
-lea_recv_arm(pTHX_ SV *stream)
+lea_recv_arm(pTHX_ SV *stream, int *host_retained)
 {
     lea_recv_ctx_t *ctx = lea_get_ctx(stream);
-    int status;
+    const les_consumer_host_api_v1_t *host = ctx->host;
+    void *host_context = ctx->host_context;
+    int status = 1;
+    int jump_status;
+    dJMPENV;
 
+    *host_retained = 0;
     LEA_PROFILE(ctx, profile_recv_calls);
 
     if (ctx->armed)
@@ -367,26 +379,98 @@ lea_recv_arm(pTHX_ SV *stream)
         return ctx;
     }
 
+    if (!ctx->in_delivery) {
+        if (!host->retain(aTHX_ host_context))
+            croak("recv(): Linux::Event consumer host is no longer available");
+        *host_retained = 1;
+    }
+
     ctx->armed = 1;
     if (!ctx->in_delivery) {
-        status = ctx->host->resume(aTHX_ ctx->host_context);
-        if (status < 0) {
-            ctx->armed = 0;
-            croak("recv(): Linux::Event consumer resume failed");
+        JMPENV_PUSH(jump_status);
+        if (jump_status == 0) {
+            status = host->resume(aTHX_ host_context);
+            if (status < 0) {
+                ctx->armed = 0;
+            } else if (status == 0 && !ctx->ready && !ctx->terminal
+                && host->is_closed(aTHX_ host_context)) {
+                ctx->armed = 0;
+                ctx->terminal = 1;
+                ctx->terminal_failure = lea_error_new(
+                    LES_CONSUMER_EVENT_CLOSED, 0,
+                    "Stream closed while receive was being armed");
+                lea_prepare_terminal_result(ctx);
+            }
+            JMPENV_POP;
+        } else {
+            JMPENV_POP;
+            host->release(aTHX_ host_context);
+            *host_retained = 0;
+            JMPENV_JUMP(jump_status);
         }
-        if (status == 0 && !ctx->ready && !ctx->terminal
-            && ctx->host->is_closed(aTHX_ ctx->host_context)) {
-            ctx->armed = 0;
-            ctx->terminal = 1;
-            ctx->terminal_failure = lea_error_new(
-                LES_CONSUMER_EVENT_CLOSED, 0,
-                "Stream closed while receive was being armed");
-            lea_prepare_terminal_result(ctx);
+        if (status < 0) {
+            host->release(aTHX_ host_context);
+            *host_retained = 0;
+            croak("recv(): Linux::Event consumer resume failed");
         }
     }
     if (ctx->ready)
         LEA_PROFILE(ctx, profile_recv_immediate);
     return ctx;
+}
+
+static SV *
+lea_recv_awaitable(pTHX_ SV *stream)
+{
+    lea_recv_ctx_t *ctx;
+    const les_consumer_host_api_v1_t *host = NULL;
+    void *host_context = NULL;
+    SV *awaitable;
+    int host_retained = 0;
+
+    ctx = lea_recv_arm(aTHX_ stream, &host_retained);
+    if (host_retained) {
+        host = ctx->host;
+        host_context = ctx->host_context;
+    }
+    awaitable = SvREFCNT_inc(ctx->awaitable);
+    if (host_retained)
+        host->release(aTHX_ host_context);
+    return awaitable;
+}
+
+static void
+lea_recv_cancel_context(pTHX_ lea_recv_ctx_t *ctx)
+{
+    const les_consumer_host_api_v1_t *host;
+    void *host_context;
+    int jump_status;
+    dJMPENV;
+
+    if (!ctx->armed)
+        return;
+
+    host = ctx->host;
+    host_context = ctx->host_context;
+    if (!host->retain(aTHX_ host_context))
+        croak("cancel_recv(): Linux::Event consumer host is no longer available");
+
+    JMPENV_PUSH(jump_status);
+    if (jump_status == 0) {
+        ctx->armed = 0;
+        ctx->cancelled = 1;
+        if (!ctx->terminal)
+            host->pause(aTHX_ host_context);
+        lea_fire_cancel(aTHX_ ctx);
+        lea_fire_ready(aTHX_ ctx);
+        JMPENV_POP;
+    } else {
+        JMPENV_POP;
+        host->release(aTHX_ host_context);
+        JMPENV_JUMP(jump_status);
+    }
+
+    host->release(aTHX_ host_context);
 }
 
 MODULE = Linux::Event::Async    PACKAGE = Linux::Event::Async::Stream
@@ -444,22 +528,16 @@ _recv_profile_stats(stream)
 SV *
 recv(stream)
     SV *stream
-    PREINIT:
-        lea_recv_ctx_t *ctx;
     CODE:
-        ctx = lea_recv_arm(aTHX_ stream);
-        RETVAL = SvREFCNT_inc(ctx->awaitable);
+        RETVAL = lea_recv_awaitable(aTHX_ stream);
     OUTPUT:
         RETVAL
 
 SV *
 _recv_arm(stream)
     SV *stream
-    PREINIT:
-        lea_recv_ctx_t *ctx;
     CODE:
-        ctx = lea_recv_arm(aTHX_ stream);
-        RETVAL = SvREFCNT_inc(ctx->awaitable);
+        RETVAL = lea_recv_awaitable(aTHX_ stream);
     OUTPUT:
         RETVAL
 
@@ -551,15 +629,7 @@ _recv_cancel(stream)
         lea_recv_ctx_t *ctx;
     CODE:
         ctx = lea_get_ctx(stream);
-        if (!ctx->armed)
-            XSRETURN_EMPTY;
-
-        ctx->armed = 0;
-        ctx->cancelled = 1;
-        if (!ctx->terminal)
-            ctx->host->pause(aTHX_ ctx->host_context);
-        lea_fire_cancel(aTHX_ ctx);
-        lea_fire_ready(aTHX_ ctx);
+        lea_recv_cancel_context(aTHX_ ctx);
 
 MODULE = Linux::Event::Async    PACKAGE = Linux::Event::Async::Stream::Awaitable
 PROTOTYPES: DISABLE
@@ -656,15 +726,7 @@ cancel_recv(awaitable)
         lea_recv_ctx_t *ctx;
     CODE:
         ctx = lea_awaitable_ctx(awaitable);
-        if (!ctx->armed)
-            XSRETURN_EMPTY;
-
-        ctx->armed = 0;
-        ctx->cancelled = 1;
-        if (!ctx->terminal)
-            ctx->host->pause(aTHX_ ctx->host_context);
-        lea_fire_cancel(aTHX_ ctx);
-        lea_fire_ready(aTHX_ ctx);
+        lea_recv_cancel_context(aTHX_ ctx);
 
 SV *
 _stream(awaitable)

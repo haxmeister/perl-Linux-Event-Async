@@ -18,6 +18,7 @@ typedef struct leaf_future_s {
     SV *ready_callback;
     AV *ready_callbacks;
     AV *cancel_callbacks;
+    SV *operation_target;
     SV *cancel_target;
     AV *cancel_chain;
 } leaf_future_t;
@@ -187,6 +188,29 @@ leaf_same_cancel_target(SV *left, SV *right)
     return SvROK(left) && SvROK(right) && SvRV(left) == SvRV(right);
 }
 
+static int
+leaf_is_reusable_operation_target(SV *target)
+{
+    HV *stash;
+    const char *name;
+
+    if (!target || !sv_isobject(target) || !SvROK(target))
+        return 0;
+    stash = SvSTASH(SvRV(target));
+    if (!stash)
+        return 0;
+    name = HvNAME(stash);
+    if (!name)
+        return 0;
+
+    return strEQ(name, "Linux::Event::Async::Stream::Awaitable")
+        || strEQ(name, "Linux::Event::Async::Listener::Awaitable")
+        || strEQ(name, "Linux::Event::Async::Dgram::Awaitable")
+        || strEQ(name, "Linux::Event::Async::Timer::Awaitable")
+        || strEQ(name, "Linux::Event::Async::Signal::Awaitable")
+        || strEQ(name, "Linux::Event::Async::Event::Awaitable");
+}
+
 static SV *
 leaf_stream_awaitable_loop(pTHX_ SV *target)
 {
@@ -223,12 +247,36 @@ leaf_stream_awaitable_loop(pTHX_ SV *target)
     return loop;
 }
 
+static SV *
+leaf_operation_awaitable_loop(pTHX_ SV *target)
+{
+    dSP;
+    SV *returned;
+    SV *loop = NULL;
+
+    ENTER;
+    SAVETMPS;
+    PUSHMARK(SP);
+    PUSHs(target);
+    PUTBACK;
+    call_method("AWAIT_LOOP", G_SCALAR);
+    SPAGAIN;
+    returned = POPs;
+    if (SvOK(returned))
+        loop = newSVsv(returned);
+    PUTBACK;
+    FREETMPS;
+    LEAVE;
+    return loop;
+}
+
 static SV *leaf_effective_loop(pTHX_ leaf_future_t *future, unsigned int depth);
 
 static SV *
 leaf_target_loop(pTHX_ SV *target, unsigned int depth)
 {
     leaf_future_t *target_future;
+    HV *stash;
 
     if (sv_derived_from(target, "Linux::Event::Async::Future")) {
         target_future = leaf_from_sv(target);
@@ -237,6 +285,11 @@ leaf_target_loop(pTHX_ SV *target, unsigned int depth)
     if (sv_derived_from(target,
             "Linux::Event::Async::Stream::Awaitable"))
         return leaf_stream_awaitable_loop(aTHX_ target);
+    if (sv_isobject(target) && SvROK(target)) {
+        stash = SvSTASH(SvRV(target));
+        if (stash && gv_fetchmethod_autoload(stash, "AWAIT_LOOP", 0))
+            return leaf_operation_awaitable_loop(aTHX_ target);
+    }
     return NULL;
 }
 
@@ -250,6 +303,13 @@ leaf_effective_loop(pTHX_ leaf_future_t *future, unsigned int depth)
 
     if (depth > 64)
         croak("Linux::Event::Async Future loop dependency is cyclic");
+
+    if (future->operation_target) {
+        loop = leaf_target_loop(aTHX_ future->operation_target, depth);
+        if (loop)
+            return loop;
+    }
+
     if (future->cancel_chain) {
         count = av_count(future->cancel_chain);
         last = count ? av_fetch(future->cancel_chain, count - 1, 0) : NULL;
@@ -283,10 +343,37 @@ leaf_follow_target_loop(pTHX_ leaf_future_t *future, SV *target)
 }
 
 static void
+leaf_clear_operation_target(leaf_future_t *future)
+{
+    if (future->operation_target) {
+        SvREFCNT_dec(future->operation_target);
+        future->operation_target = NULL;
+    }
+}
+
+static void
 leaf_add_cancel_target(pTHX_ leaf_future_t *future, SV *target)
 {
     SSize_t count;
     SV **last;
+
+    /*
+     * Linux::Event repeated-operation Awaitables are resource-owned and reused
+     * for successive waits. They represent the current suspension only. Keep
+     * exactly one such cancellation target so an old async task cannot cancel
+     * a later unrelated operation after the Awaitable has been rearmed.
+     */
+    if (leaf_is_reusable_operation_target(target)) {
+        leaf_follow_target_loop(aTHX_ future, target);
+        if (future->operation_target
+            && leaf_same_cancel_target(future->operation_target, target))
+            return;
+        leaf_clear_operation_target(future);
+        future->operation_target = newSVsv(target);
+        return;
+    }
+
+    leaf_clear_operation_target(future);
 
     if (!future->cancel_target) {
         leaf_follow_target_loop(aTHX_ future, target);
@@ -329,6 +416,7 @@ leaf_discard_cancel_state(leaf_future_t *future)
         SvREFCNT_dec((SV *)future->cancel_callbacks);
         future->cancel_callbacks = NULL;
     }
+    leaf_clear_operation_target(future);
     if (future->cancel_target) {
         SvREFCNT_dec(future->cancel_target);
         future->cancel_target = NULL;
@@ -591,6 +679,7 @@ cancel(future_obj)
     PREINIT:
         leaf_future_t *future;
         AV *cancel_callbacks;
+        SV *operation_target;
         SV *cancel_target;
         AV *cancel_chain;
         SV *ready_callback;
@@ -600,17 +689,23 @@ cancel(future_obj)
         future = leaf_from_sv(future_obj);
         if (future->state == LEAF_PENDING) {
             cancel_callbacks = future->cancel_callbacks;
+            operation_target = future->operation_target;
             cancel_target = future->cancel_target;
             cancel_chain = future->cancel_chain;
             ready_callback = future->ready_callback;
             ready_callbacks = future->ready_callbacks;
             future->cancel_callbacks = NULL;
+            future->operation_target = NULL;
             future->cancel_target = NULL;
             future->cancel_chain = NULL;
             future->ready_callback = NULL;
             future->ready_callbacks = NULL;
             future->state = LEAF_CANCELLED;
             leaf_call_callbacks(aTHX_ cancel_callbacks, &failure);
+            if (operation_target) {
+                leaf_cancel_target(aTHX_ operation_target, &failure);
+                SvREFCNT_dec(operation_target);
+            }
             if (cancel_target) {
                 leaf_cancel_target(aTHX_ cancel_target, &failure);
                 SvREFCNT_dec(cancel_target);
@@ -654,6 +749,7 @@ DESTROY(future_obj)
                 if (future->ready_callback) SvREFCNT_dec(future->ready_callback);
                 if (future->ready_callbacks) SvREFCNT_dec((SV *)future->ready_callbacks);
                 if (future->cancel_callbacks) SvREFCNT_dec((SV *)future->cancel_callbacks);
+                if (future->operation_target) SvREFCNT_dec(future->operation_target);
                 if (future->cancel_target) SvREFCNT_dec(future->cancel_target);
                 if (future->cancel_chain) SvREFCNT_dec((SV *)future->cancel_chain);
                 Safefree(future);

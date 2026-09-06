@@ -161,6 +161,29 @@ sub pair () {
 
 {
     my ($loop, $stream, $peer) = pair();
+    my $recv = $stream->recv;
+    my ($cancelled, $ready) = (0, 0);
+    $recv->AWAIT_ON_CANCEL(sub {
+        $cancelled++;
+        $stream->close;
+    });
+    $recv->AWAIT_ON_READY(sub { $ready++ });
+
+    my $error = eval { $recv->cancel_recv; 1 } ? '' : $@;
+    is($error, '',
+        'closing the Stream from a cancellation callback is lifetime-safe');
+    is($cancelled, 1,
+        'reentrant close cancellation callback fires exactly once');
+    is($ready, 1,
+        'ready callback survives reentrant Stream destruction');
+    ok($stream->is_closed,
+        'Stream is closed after reentrant cancellation callback');
+
+    close $peer;
+}
+
+{
+    my ($loop, $stream, $peer) = pair();
 
     async sub read_two ($s) {
         my $first = await $s->recv;
