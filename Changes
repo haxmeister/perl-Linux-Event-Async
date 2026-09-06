@@ -67,14 +67,21 @@ Revision history for Linux-Event-Async
     - Follow the currently awaited Linux::Event Loop when an async sub composes
       sequential operations across different Loops, including through nested
       child async subs.
+    - Keep async-sub cancellation attached to the currently suspended persistent
+      Linux::Event operation rather than retaining historical reusable Awaitable
+      targets. Cancelling an older task therefore cannot cancel an unrelated
+      later wait after the same resource-owned Awaitable has been rearmed.
     - Make native consumer teardown safe during Perl global destruction.
     - Add regression coverage for Stream readiness/drain/receive, Listener
       acceptance, Datagram receive/drain, Timer waits, Process completion and
       final pipe drain, Signal delivery/coalescing/cancellation, Event delivery
-      and cancellation, multi-task composition, global destruction, and stress
+      and cancellation, stale cancellation across a rearmed persistent
+      Awaitable, multi-task composition, global destruction, and stress
       lifecycles.
     - Run release CI against Linux::Event 0.110 on Perl 5.36 and 5.44 with
-      make test and make disttest, plus a current-core integration lane.
+      make test and make disttest, plus current-core integration and a threaded
+      Perl 5.44 lane against Linux::Event 0.110. The threaded lane exercises the
+      Event clone signaling boundary as well as the ordinary Async suite.
       Same-repository PR events skip duplicate jobs while fork PRs retain CI.
     - Declare the Test2::V0 dependency required by the Future::AsyncAwait
       alternative-Awaitable conformance suite.
