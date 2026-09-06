@@ -128,6 +128,13 @@ chained Awaitable operation when applicable. Cancelling an async-sub Future that
 is waiting for C<< $stream->recv >> cancels that receive without closing the
 Stream.
 
+Persistent Linux::Event operation Awaitables are resource-owned and reused for
+successive waits. The Future therefore tracks only the currently suspended
+persistent operation for cancellation. Once an async sub advances to another
+operation, the old reusable Awaitable is no longer a cancellation target. If
+unrelated work later rearms that old Awaitable, cancelling the earlier async sub
+cannot cancel the new wait.
+
 Cancellation semantics for a directly returned operation Future belong to that
 operation. For example, cancelling C<< $stream->ready >> cancels only that
 readiness wait; it does not close or cancel the Stream connection.
