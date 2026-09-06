@@ -27,6 +27,7 @@ and eventfd notification:
 - `Linux::Event::Async::Event` with persistent eventfd `wait` and scalar idle
   coalescing;
 - wait-local cancellation where cancellation means abandoning a suspension;
+- cancellation propagation bound to the currently suspended reusable operation;
 - bounded native Stream prefetch; and
 - reentrant close/lifetime safety across the consumer ABI.
 
@@ -247,6 +248,12 @@ subclass or complete implementation of CPAN `Future`.
 async sub is currently awaiting. Sequential operations may move between Loops,
 including through nested async subs.
 
+Persistent operation Awaitables are resource-owned and reused. Cancellation
+state therefore distinguishes the current reusable Linux::Event operation from
+ordinary Future cancellation chains. Advancing to a different suspension
+replaces the reusable operation target; an old async task cannot later cancel an
+unrelated wait that has rearmed the same resource-owned Awaitable.
+
 ## Performance invariants
 
 The stable design should preserve these constraints:
@@ -266,7 +273,9 @@ The stable design should preserve these constraints:
 12. Async buffering, prefetch, and idle retention remain explicitly bounded.
 13. Pull-style resources must not silently discard work removed behind a
     completed Awaitable.
-14. Lifecycle correctness under cancellation, close, EOF, failure, reentrancy,
+14. Cancellation of an async task must reach its current reusable operation,
+    never an unrelated later generation of a previously awaited resource.
+15. Lifecycle correctness under cancellation, close, EOF, failure, reentrancy,
     and destruction takes precedence over speculative batching wins.
 
 Benchmark changes to hot paths must be paired with correctness tests.
@@ -279,9 +288,13 @@ The 0.002 candidate should satisfy all of the following:
 - vendored consumer ABI header matches the supported core ABI;
 - build/test/disttest pass on Perl 5.36 and 5.44 against Linux::Event 0.110;
 - a separate integration lane passes against current Linux::Event main;
+- a threaded Perl 5.44 lane passes against Linux::Event 0.110, including the
+  Event cloned-signal-handle boundary;
 - Future::AsyncAwait alternate-Awaitable conformance passes;
 - Stream readiness, drain, receive, cancellation, EOF, prefetch, reentrancy,
   global destruction, and stress tests pass;
+- sequential reusable-Awaitable cancellation is generation-safe: cancellation
+  of an older task cannot cancel a later unrelated wait after rearm;
 - Listener repeated acceptance, cancellation/retry, close/error, backlog
   preservation, and Async Stream handoff pass;
 - Datagram readiness, ordered receive, kernel-queue preservation,
@@ -295,8 +308,8 @@ The 0.002 candidate should satisfy all of the following:
   wait-local cancellation, terminal cancellation, and reentrant cancellation
   pass;
 - Event repeated delivery, idle count accumulation, detached pre-attach signal,
-  wait-local cancellation, terminal cancellation, and reentrant cancellation
-  pass;
+  wait-local cancellation, terminal cancellation, reentrant cancellation, and
+  ithread clone signaling pass;
 - `make disttest` includes every public module and regression file;
 - distribution metadata declares every runtime/test dependency and public
   module; and
